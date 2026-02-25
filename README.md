@@ -1,171 +1,216 @@
 # Smart Medicine Reminder
 
-Offline-first smart medicine reminder using:
-- Android Flutter app (phone-side local notifications)
-- ESP32 + Bluetooth Classic SPP (sync/config only)
-- DS3231 RTC + NVS persistence (autonomous pillbox operation)
+> Offline medicine reminder system using an Android app + ESP32 pillbox (Bluetooth Classic SPP, RTC, servo compartments).
 
-## Repository Layout
+![Device Photo 1](docs/images/device-photo-1.jpg)
+![Device Photo 2](docs/images/device-photo-2.jpg)
+![System Overview](docs/images/system-overview.jpg)
+
+Add your real project pictures to `docs/images/` and keep these filenames, or update the paths above.
+
+## Overview
+
+Smart Medicine Reminder is an offline-first system designed for daily medicine intake reminders.
+
+- **Android app** handles schedule setup, local reminders, records, and Bluetooth sync.
+- **ESP32 device** stores schedule + clock and opens the correct compartment autonomously.
+- **No Wi-Fi/cloud required** for normal operation.
+
+## Current Features
+
+### App (Android)
+- Tabs: `Schedule`, `Connect`, `Records`, `About`
+- Set 3 daily medicine times
+- Sync schedule + time to ESP32 over Bluetooth Classic SPP
+- Local phone notifications (exact alarms when allowed)
+- Check/acknowledge medicine from app
+- Daily intake records and summary
+
+### Firmware (ESP32)
+- Bluetooth Classic name: `Smart-Medicine-Reminder`
+- DS3231 RTC support (time sync from app)
+- Schedule persistence in NVS
+- 3-servo compartment control
+- Buzzer alert pattern for due medicines
+- Patient buttons:
+  - **Button A** (GPIO 32): acknowledge due medicine, close compartments, silence buzzer
+  - **Button B** (GPIO 33, hold ~2s): toggle refill mode (open/close all)
+- Patient-friendly LCD messages (16x2 I2C)
+
+## Repository Structure
 
 ```text
-app/        Flutter Android app
-firmware/   ESP32 Arduino sketch
-docs/       Project documentation and test log
-tools/      Optional utilities and notes
+app/        Flutter Android application
+firmware/   ESP32 Arduino firmware + test sketches
+docs/       Project docs, test logs, user manual
+tools/      Optional helper files
 ```
 
-## What Works in This Scaffold
+## Hardware Summary
 
-- Schedule UI with 3 medicine rows (`SET`, label, `HH:MM`)
-- Current time display updating every second
-- Connect Device screen with scan + connect flow
-- SPP protocol commands from app (`TIME`, `SYNC`) with response handling
-- Daily local notifications for medicine 1/2/3
-- Local persistence of schedule + last sync timestamp
-- ESP32 firmware protocol parser:
-  - `GET`
-  - `SYNC,HH:MM,HH:MM,HH:MM`
-  - `SET,slot,HH:MM`
-  - `TIME,YYYY-MM-DD,HH:MM:SS`
-  - `TEST,slot`
-- ESP32 autonomous scheduler with daily trigger lockout
-- ESP32 schedule persistence in NVS
+See full lists here:
+- `components.md`
+- `circuit.md`
 
-## Android App Setup
+### Firmware pin map (current)
+
+- Servo 1: GPIO `25`
+- Servo 2: GPIO `26`
+- Servo 3: GPIO `27`
+- Buzzer: GPIO `14`
+- Button A: GPIO `32`
+- Button B: GPIO `33`
+- I2C SDA: GPIO `21`
+- I2C SCL: GPIO `22`
+- LCD I2C address: `0x27` (change in firmware if your module is `0x3F`)
+
+## Important Power Notes
+
+- Use a stable 5V supply for servos (typically 2A to 3A or higher depending on load).
+- Keep **common ground** between ESP32 and servo supply.
+- For refill operations, keep the device powered from the **rear USB Type-C port** for stable operation.
+- Add a bulk capacitor (`470uF` to `1000uF`) near servo 5V/GND rails.
+
+## Quick Start
+
+### 1) Android App Setup
 
 Prerequisites:
-- Flutter SDK installed and on `PATH`
-- Android SDK + a physical Android device
-
-Commands:
+- Flutter SDK in PATH
+- Android SDK installed
+- Physical Android phone (recommended)
 
 ```bash
 cd app
-[ -f android/gradlew ] || flutter create --platforms android .
-cp android/local.properties.example android/local.properties
-# edit android/local.properties with your local Android/Flutter SDK paths
 flutter pub get
+cp android/local.properties.example android/local.properties
+# edit android/local.properties with your SDK paths
 flutter run -d <android-device-id>
 ```
 
 Notes:
-- App is Android-only by design.
-- If Bluetooth pairing is unreliable in-app, pair first via Android Bluetooth settings.
-- On Android 13+, grant notification permission.
-- For best reminder precision, allow exact alarms in app settings.
+- Android 12+: grant Bluetooth permissions.
+- Android 13+: grant notification permission.
+- Enable exact alarms for best reminder timing.
 
-## Android Release Build (AAB/APK)
+### 2) ESP32 Firmware Setup
 
-1. Set your app version in `app/pubspec.yaml` (for example: `1.0.0+1`).
-2. Create an upload keystore (run once):
+Main sketch:
+- `firmware/smart_medicine_reminder/smart_medicine_reminder.ino`
 
-```bash
-cd app/android
-keytool -genkey -v \
-  -keystore ../upload-keystore.jks \
-  -alias upload \
-  -keyalg RSA \
-  -keysize 2048 \
-  -validity 10000
-```
+Required Arduino libraries:
+- `ESP32Servo`
+- `RTClib`
+- `LiquidCrystal_I2C`
+- `BluetoothSerial` / `Preferences` / `Wire` (from ESP32 core)
 
-3. Create signing properties:
+Steps:
+1. Open Arduino IDE.
+2. Select ESP32 board profile.
+3. Wire RTC/LCD/buttons/servos/buzzer based on `circuit.md`.
+4. Upload firmware.
+5. Open Serial Monitor at `115200` baud.
 
-```bash
-cd app/android
-cp key.properties.example key.properties
-```
+## Operating Flow
 
-4. Edit `app/android/key.properties`:
-   - `storePassword`: keystore password
-   - `keyPassword`: key password
-   - `keyAlias`: alias used in keytool command (default `upload`)
-   - `storeFile`: path to keystore (default `../upload-keystore.jks`)
+1. Power the device and open the app.
+2. Go to `Connect` tab, connect to `Smart-Medicine-Reminder`.
+3. Go to `Schedule`, set medicine times, tap `SYNC / SAVE TO DEVICE`.
+4. At due time:
+   - phone notification fires,
+   - compartment opens,
+   - buzzer alerts.
+5. Acknowledge intake:
+   - press **Button A** on device, or
+   - tap the check button in app.
 
-5. Build release artifacts:
+## Refill Mode
+
+- To use refill mode safely, power the device through the **back USB Type-C port**.
+- Hold **Button B** for ~2 seconds to enter refill mode.
+- All compartments open and stay open.
+- Hold **Button B** again for ~2 seconds to close and exit refill mode.
+
+## Bluetooth SPP Protocol
+
+### App -> Device
+- `GET`
+- `TIME,YYYY-MM-DD,HH:MM:SS`
+- `SYNC,HH:MM,HH:MM,HH:MM`
+- `SET,1,HH:MM` (or slot 2/3)
+- `TEST,1` (or slot 2/3)
+- `ACK,1` (or slot 2/3)
+
+### Device -> App
+- `OK,...`
+- `SCHED,1,HH:MM,2,HH:MM,3,HH:MM`
+- `ERR,BAD_FORMAT`
+- `ERR,RTC_NOT_SET`
+- `EVT,DUE,<m1>,<m2>,<m3>`
+- `EVT,TAKEN,<m1>,<m2>,<m3>`
+- `EVT,REFILL,ON|OFF`
+
+## Build Release APK
 
 ```bash
 cd app
 flutter clean
 flutter pub get
-flutter build appbundle --release
 flutter build apk --release
 ```
 
-6. Output files:
-   - AAB: `app/build/app/outputs/bundle/release/app-release.aab`
-   - APK: `app/build/app/outputs/flutter-apk/app-release.apk`
+Output:
+- `app/build/app/outputs/flutter-apk/app-release.apk`
 
-Note:
-- If `app/android/key.properties` is missing, Gradle falls back to debug signing for release builds. This is only for local testing, not Play Store upload.
+If you also need Play Store bundle:
 
-## ESP32 Firmware Setup
+```bash
+flutter build appbundle --release
+```
 
-Sketch:
-- `firmware/smart_medicine_reminder.ino`
+## Test Sketches
 
-Arduino dependencies:
-- ESP32 Arduino core
-- `RTClib`
-- `ESP32Servo`
+Firmware subsystem tests are available in:
+- `firmware/tests/README.md`
 
-Steps:
-1. Open the sketch in Arduino IDE.
-2. Select an ESP32 board (e.g., `ESP32 Dev Module`).
-3. Wire RTC + servos as below.
-4. Upload firmware.
-5. Open serial monitor at `115200` baud for debug logs.
-
-## Suggested Wiring
-
-- DS3231:
-  - `VCC -> 3V3` (or module-supported `5V`, depending on board/module)
-  - `GND -> GND`
-  - `SDA -> GPIO21`
-  - `SCL -> GPIO22`
-- Servo signals:
-  - Compartment 1 -> `GPIO25`
-  - Compartment 2 -> `GPIO26`
-  - Compartment 3 -> `GPIO27`
-
-## Power Notes (Important)
-
-- Use a dedicated 5V rail for servos (recommended 5V 2A minimum, 3A preferred).
-- ESP32 should be powered separately from USB/regulated source.
-- Share common ground between ESP32 and servo power supply.
-- Add bulk capacitance near servo rail to avoid brownouts during movement.
-
-## Bluetooth SPP Protocol
-
-App to device:
-- `GET\n`
-- `SYNC,HH:MM,HH:MM,HH:MM\n`
-- `SET,1,HH:MM\n` / `SET,2,HH:MM\n` / `SET,3,HH:MM\n`
-- `TIME,YYYY-MM-DD,HH:MM:SS\n`
-- `TEST,1\n` / `TEST,2\n` / `TEST,3\n`
-
-Device to app:
-- `OK\n`
-- `SCHED,1,HH:MM,2,HH:MM,3,HH:MM\n`
-- `ERR,BAD_FORMAT\n`
-- `ERR,RTC_NOT_SET\n`
+Includes:
+- Power/boot diagnostics
+- Bluetooth-only stability
+- RTC test
+- Servo direction and calibration tools
+- Servo sweep diagnostics
 
 ## Troubleshooting
 
-- Device not visible in scan list:
-  - Confirm board is powered and Bluetooth name is `Smart-Medicine-Reminder`.
-  - Pair once from Android settings, then retry in-app.
-- Notifications not appearing:
-  - Check app notification permission.
-  - Disable battery optimization for this app if your phone is aggressive.
-- Reboots when servos move:
-  - This is usually power rail sag. Use separate servo PSU and common GND.
-- Wrong trigger timing:
-  - Send `TIME,...` from app during each sync to keep RTC aligned.
+### Device not found in Bluetooth scan
+- Confirm firmware is running and device is powered.
+- Confirm Bluetooth name is `Smart-Medicine-Reminder`.
+- Try pairing once in Android Settings, then reconnect in app.
 
-## Current Validation Status
+### LCD garbled or blinking
+- Check power stability and common ground.
+- Check I2C wiring (SDA 21 / SCL 22).
+- Verify LCD address (`0x27` vs `0x3F`).
 
-- Android release build validated on `2026-02-22`:
-  - `flutter build appbundle --release` succeeded
-  - `flutter build apk --release` succeeded
-- Firmware flashing/runtime hardware tests are still required on a physical ESP32 + DS3231 + servo setup.
+### ESP32 resets or brownout
+- Usually power issue.
+- Separate servo power from ESP32 logic power.
+- Add capacitor near servo rail.
+
+### Buzzer not audible
+- Verify buzzer type and wiring to GPIO 14.
+- Confirm shared ground.
+- Check volume and mounting direction of buzzer module.
+
+### Notifications delayed/missing
+- Grant notification + exact alarm permissions.
+- Disable aggressive battery optimization for the app.
+- Reopen app and tap `SYNC`.
+
+## Documentation
+
+- System planning: `description.md`
+- Hardware components: `components.md`
+- Circuit wiring: `circuit.md`
+- User manual: `docs/user_manual.md`
+- Test log: `docs/test_log.md`
