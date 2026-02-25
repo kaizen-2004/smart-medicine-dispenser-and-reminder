@@ -1,0 +1,15 @@
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub/
+/build/
+/android/.gradle/
+/android/local.properties
+/android/key.properties
+upload-keystore.jks
+/ios/
+/linux/
+/macos/
+/windows/
+/web/

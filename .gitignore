@@ -1,0 +1,57 @@
+# Smart Medicine Reminder monorepo ignore rules
+# Keep source, docs, and example config files tracked.
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+
+# Secrets and machine-local config
+.env
+.env.*
+!.env.example
+*.keystore
+*.jks
+*.pem
+*.p12
+app/android/local.properties
+app/android/key.properties
+
+# Flutter / Dart generated files (app)
+app/.dart_tool/
+app/.flutter-plugins
+app/.flutter-plugins-dependencies
+app/.packages
+app/.pub/
+app/build/
+
+# Android generated/build artifacts (app)
+app/android/.gradle/
+app/android/.cxx/
+app/android/captures/
+app/android/app/debug/
+app/android/app/profile/
+app/android/app/release/
+app/android/**/GeneratedPluginRegistrant.java
+
+# Distributables
+*.apk
+*.aab
+
+# Firmware local build/tool artifacts
+firmware/.pio/
+firmware/build/
+
+# Generic build/test output
+build/
+coverage/
