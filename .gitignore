@@ -10,6 +10,7 @@ Thumbs.db
 *.swp
 *.swo
 *~
+AGENTS.md
 
 # Logs and temporary files
 *.log
