@@ -6,8 +6,6 @@
 ![Device Photo 2](docs/images/device-photo-2.jpg)
 ![System Overview](docs/images/system-overview.jpg)
 
-Add your real project pictures to `docs/images/` and keep these filenames, or update the paths above.
-
 ## Overview
 
 Smart Medicine Reminder is an offline-first system designed for daily medicine intake reminders.
@@ -19,6 +17,7 @@ Smart Medicine Reminder is an offline-first system designed for daily medicine i
 ## Current Features
 
 ### App (Android)
+
 - Tabs: `Schedule`, `Connect`, `Records`, `About`
 - Set 3 daily medicine times
 - Sync schedule + time to ESP32 over Bluetooth Classic SPP
@@ -27,6 +26,7 @@ Smart Medicine Reminder is an offline-first system designed for daily medicine i
 - Daily intake records and summary
 
 ### Firmware (ESP32)
+
 - Bluetooth Classic name: `Smart-Medicine-Reminder`
 - DS3231 RTC support (time sync from app)
 - Schedule persistence in NVS
@@ -49,6 +49,7 @@ tools/      Optional helper files
 ## Hardware Summary
 
 See full lists here:
+
 - `components.md`
 - `circuit.md`
 
@@ -76,6 +77,7 @@ See full lists here:
 ### 1) Android App Setup
 
 Prerequisites:
+
 - Flutter SDK in PATH
 - Android SDK installed
 - Physical Android phone (recommended)
@@ -89,6 +91,7 @@ flutter run -d <android-device-id>
 ```
 
 Notes:
+
 - Android 12+: grant Bluetooth permissions.
 - Android 13+: grant notification permission.
 - Enable exact alarms for best reminder timing.
@@ -96,15 +99,18 @@ Notes:
 ### 2) ESP32 Firmware Setup
 
 Main sketch:
+
 - `firmware/smart_medicine_reminder/smart_medicine_reminder.ino`
 
 Required Arduino libraries:
+
 - `ESP32Servo`
 - `RTClib`
 - `LiquidCrystal_I2C`
 - `BluetoothSerial` / `Preferences` / `Wire` (from ESP32 core)
 
 Steps:
+
 1. Open Arduino IDE.
 2. Select ESP32 board profile.
 3. Wire RTC/LCD/buttons/servos/buzzer based on `circuit.md`.
@@ -134,6 +140,7 @@ Steps:
 ## Bluetooth SPP Protocol
 
 ### App -> Device
+
 - `GET`
 - `TIME,YYYY-MM-DD,HH:MM:SS`
 - `SYNC,HH:MM,HH:MM,HH:MM`
@@ -142,6 +149,7 @@ Steps:
 - `ACK,1` (or slot 2/3)
 
 ### Device -> App
+
 - `OK,...`
 - `SCHED,1,HH:MM,2,HH:MM,3,HH:MM`
 - `ERR,BAD_FORMAT`
@@ -160,6 +168,7 @@ flutter build apk --release
 ```
 
 Output:
+
 - `app/build/app/outputs/flutter-apk/app-release.apk`
 
 If you also need Play Store bundle:
@@ -171,9 +180,11 @@ flutter build appbundle --release
 ## Test Sketches
 
 Firmware subsystem tests are available in:
+
 - `firmware/tests/README.md`
 
 Includes:
+
 - Power/boot diagnostics
 - Bluetooth-only stability
 - RTC test
@@ -183,26 +194,31 @@ Includes:
 ## Troubleshooting
 
 ### Device not found in Bluetooth scan
+
 - Confirm firmware is running and device is powered.
 - Confirm Bluetooth name is `Smart-Medicine-Reminder`.
 - Try pairing once in Android Settings, then reconnect in app.
 
 ### LCD garbled or blinking
+
 - Check power stability and common ground.
 - Check I2C wiring (SDA 21 / SCL 22).
 - Verify LCD address (`0x27` vs `0x3F`).
 
 ### ESP32 resets or brownout
+
 - Usually power issue.
 - Separate servo power from ESP32 logic power.
 - Add capacitor near servo rail.
 
 ### Buzzer not audible
+
 - Verify buzzer type and wiring to GPIO 14.
 - Confirm shared ground.
 - Check volume and mounting direction of buzzer module.
 
 ### Notifications delayed/missing
+
 - Grant notification + exact alarm permissions.
 - Disable aggressive battery optimization for the app.
 - Reopen app and tap `SYNC`.
