@@ -6,6 +6,12 @@ class ScheduleStorage {
   static const String _medicine1Key = "medicine_1";
   static const String _medicine2Key = "medicine_2";
   static const String _medicine3Key = "medicine_3";
+  static const String _medicine1ModeKey = "medicine_1_mode";
+  static const String _medicine2ModeKey = "medicine_2_mode";
+  static const String _medicine3ModeKey = "medicine_3_mode";
+  static const String _medicine1DateKey = "medicine_1_date";
+  static const String _medicine2DateKey = "medicine_2_date";
+  static const String _medicine3DateKey = "medicine_3_date";
   static const String _lastSyncIsoKey = "last_sync_iso";
 
   Future<MedicineSchedule> loadSchedule() async {
@@ -14,15 +20,26 @@ class ScheduleStorage {
       _medicine1Key: prefs.getString(_medicine1Key),
       _medicine2Key: prefs.getString(_medicine2Key),
       _medicine3Key: prefs.getString(_medicine3Key),
+      _medicine1ModeKey: prefs.getString(_medicine1ModeKey),
+      _medicine2ModeKey: prefs.getString(_medicine2ModeKey),
+      _medicine3ModeKey: prefs.getString(_medicine3ModeKey),
+      _medicine1DateKey: prefs.getString(_medicine1DateKey),
+      _medicine2DateKey: prefs.getString(_medicine2DateKey),
+      _medicine3DateKey: prefs.getString(_medicine3DateKey),
     });
   }
 
   Future<void> saveSchedule(MedicineSchedule schedule) async {
     final prefs = await SharedPreferences.getInstance();
     final map = schedule.toStorageMap();
-    await prefs.setString(_medicine1Key, map[_medicine1Key]!);
-    await prefs.setString(_medicine2Key, map[_medicine2Key]!);
-    await prefs.setString(_medicine3Key, map[_medicine3Key]!);
+    for (final entry in map.entries) {
+      final value = entry.value;
+      if (value == null || value.isEmpty) {
+        await prefs.remove(entry.key);
+      } else {
+        await prefs.setString(entry.key, value);
+      }
+    }
   }
 
   Future<DateTime?> loadLastSync() async {

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import 'models/medicine_schedule.dart';
 import 'screens/app_shell.dart';
+import 'screens/startup_splash_screen.dart';
 import 'services/bluetooth_service.dart';
 import 'services/notification_service.dart';
 import 'services/schedule_storage.dart';
@@ -83,12 +84,17 @@ class _SmartMedicineReminderAppState extends State<SmartMedicineReminderApp> {
         ),
         useMaterial3: true,
       ),
-      home: AppShell(
-        notificationService: widget.notificationService,
-        scheduleStorage: widget.storage,
-        bluetoothService: _bluetoothService,
-        initialSchedule: widget.initialSchedule,
-        initialLastSync: widget.initialLastSync,
+      home: StartupSplashScreen(
+        minimumDuration: const Duration(milliseconds: 5000),
+        fadeInDuration: const Duration(milliseconds: 400),
+        fadeOutDuration: const Duration(milliseconds: 640),
+        child: AppShell(
+          notificationService: widget.notificationService,
+          scheduleStorage: widget.storage,
+          bluetoothService: _bluetoothService,
+          initialSchedule: widget.initialSchedule,
+          initialLastSync: widget.initialLastSync,
+        ),
       ),
     );
   }

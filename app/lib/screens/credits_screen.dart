@@ -6,7 +6,7 @@ class AboutScreen extends StatelessWidget {
   static const List<_TeamMember> _members = [
     _TeamMember(name: "Kim Trumata", role: "Leader"),
     _TeamMember(name: "Red Javeed Gonzales"),
-    _TeamMember(name: "Louille Serqueña"),
+    _TeamMember(name: "Louielle Serqueña"),
     _TeamMember(name: "Lawrence Clavio"),
     _TeamMember(name: "Alliyah Gabrielle Mendoza"),
     _TeamMember(name: "Meia Benjamin Serduar"),

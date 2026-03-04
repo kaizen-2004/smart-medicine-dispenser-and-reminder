@@ -15,12 +15,12 @@ enum _DoseStatus { done, upcoming, due }
 
 class _NextIntake {
   final int medicineNumber;
-  final DailyTime time;
+  final MedicinePlan plan;
   final DateTime dateTime;
 
   const _NextIntake({
     required this.medicineNumber,
-    required this.time,
+    required this.plan,
     required this.dateTime,
   });
 }
@@ -68,10 +68,13 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
   bool _syncing = false;
   DateTime _now = DateTime.now();
   Map<int, bool> _takenToday = {1: false, 2: false, 3: false};
+  Map<int, bool> _deviceDueToday = {1: false, 2: false, 3: false};
+  final Set<int> _markingInProgress = <int>{};
   String _takenDateKey = "";
   _SyncStateType _syncState = _SyncStateType.idle;
-  String _syncStateMessage = "Ready. Tap SYNC to push schedule to device.";
+  String _syncStateMessage = "Tap SYNC to update phone and device.";
   bool _useExactAlarms = true;
+  bool _autoSyncing = false;
 
   Timer? _clockTimer;
   StreamSubscription<int>? _statusSubscription;
@@ -103,9 +106,15 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
       if (!mounted) {
         return;
       }
+      final wasConnected = _isConnected;
+      final isNowConnected = status == Device.connected;
       setState(() {
-        _isConnected = status == Device.connected;
+        _isConnected = isNowConnected;
       });
+
+      if (!wasConnected && isNowConnected) {
+        unawaited(_autoSyncOnReconnect());
+      }
     });
 
     _lineSubscription = widget.bluetoothService.onLineReceived.listen((line) {
@@ -133,6 +142,18 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
     }
 
     final eventType = parts[1];
+    if (eventType == "DUE" && parts.length >= 5 && mounted) {
+      setState(() {
+        for (var i = 0; i < 3; i++) {
+          if (parts[i + 2] == "1") {
+            _deviceDueToday[i + 1] = true;
+          }
+        }
+        _now = DateTime.now();
+      });
+      return;
+    }
+
     if (eventType == "TAKEN" && parts.length >= 5) {
       final takenFromDevice = <int>[];
       for (var i = 0; i < 3; i++) {
@@ -171,6 +192,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
         updatedTaken[medicineNumber] = true;
         changed = true;
       }
+      _deviceDueToday[medicineNumber] = false;
       await widget.scheduleStorage.saveTakenStateForDate(
         now,
         medicineNumber: medicineNumber,
@@ -181,12 +203,15 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
         await widget.notificationService.cancelReminderForMedicine(
           medicineNumber,
         );
-        await widget.notificationService.scheduleReminderForMedicine(
-          medicineNumber,
-          _schedule.timeForMedicine(medicineNumber),
-          useExactAlarms: _useExactAlarms,
-          delaySeconds: 0,
-        );
+        final plan = _schedule.planForMedicine(medicineNumber);
+        if (plan.isDaily) {
+          await widget.notificationService.scheduleReminderForPlan(
+            medicineNumber,
+            plan,
+            useExactAlarms: _useExactAlarms,
+            delaySeconds: 0,
+          );
+        }
       } catch (_) {}
     }
 
@@ -194,12 +219,14 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
       return;
     }
 
-    if (changed) {
-      setState(() {
-        _takenToday = updatedTaken;
-        _now = now;
-      });
+    if (!changed) {
+      return;
     }
+
+    setState(() {
+      _takenToday = updatedTaken;
+      _now = now;
+    });
 
     final label = medicines.join(", ");
     _showSnack("Device acknowledged medicine $label.");
@@ -212,11 +239,66 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
     );
   }
 
-  Future<void> _pickTimeForMedicine(int medicineNumber) async {
-    final current = _schedule.timeForMedicine(medicineNumber).toTimeOfDay();
-    final picked = await showTimePicker(
+  Future<void> _autoSyncOnReconnect() async {
+    if (!mounted || !_isConnected || _syncing || _autoSyncing) {
+      return;
+    }
+
+    setState(() {
+      _autoSyncing = true;
+      _syncing = true;
+      _syncState = _SyncStateType.syncing;
+      _syncStateMessage = "Connected. Auto-syncing device...";
+    });
+
+    try {
+      final result = await _syncDeviceClockAndSchedule();
+      final syncError = result.$1;
+      final syncWarning = result.$2;
+      if (!mounted) {
+        return;
+      }
+
+      if (syncError != null) {
+        _setSyncState(
+          _SyncStateType.error,
+          "Connected, but auto-sync failed: $syncError",
+        );
+        return;
+      }
+
+      final syncAt = _lastSync == null
+          ? _formatDateTime(DateTime.now())
+          : _formatDateTime(_lastSync!);
+      _setSyncState(
+        _SyncStateType.success,
+        syncWarning == null
+            ? "Auto-sync complete at $syncAt."
+            : "Auto-sync complete at $syncAt. $syncWarning",
+      );
+    } finally {
+      if (mounted) {
+        setState(() {
+          _autoSyncing = false;
+          _syncing = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _configureMedicinePlan(int medicineNumber) async {
+    final currentPlan = _schedule.planForMedicine(medicineNumber);
+    final selectedMode = await _showScheduleTypeDialog(currentPlan.mode);
+    if (selectedMode == null) {
+      return;
+    }
+    if (!mounted) {
+      return;
+    }
+
+    final pickedTime = await showTimePicker(
       context: context,
-      initialTime: current,
+      initialTime: currentPlan.time.toTimeOfDay(),
       builder: (context, child) {
         return Theme(
           data: Theme.of(context).copyWith(
@@ -226,15 +308,57 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
         );
       },
     );
-
-    if (picked == null) {
+    if (pickedTime == null) {
+      return;
+    }
+    if (!mounted) {
       return;
     }
 
-    final newTime = DailyTime.fromTimeOfDay(picked);
-    final updated = _schedule.withMedicineTime(medicineNumber, newTime);
+    final newTime = DailyTime.fromTimeOfDay(pickedTime);
+    MedicinePlan newPlan;
+    if (selectedMode == MedicineScheduleMode.daily) {
+      newPlan = MedicinePlan.daily(newTime);
+    } else {
+      final initialDate = currentPlan.oneTimeDate ?? _now;
+      final pickedDate = await showDatePicker(
+        context: context,
+        initialDate: DateTime(
+          initialDate.year,
+          initialDate.month,
+          initialDate.day,
+        ),
+        firstDate: DateTime(_now.year, _now.month, _now.day),
+        lastDate: DateTime(_now.year + 5, 12, 31),
+      );
+      if (pickedDate == null) {
+        return;
+      }
+      if (!mounted) {
+        return;
+      }
+
+      final oneTimeDateTime = DateTime(
+        pickedDate.year,
+        pickedDate.month,
+        pickedDate.day,
+        newTime.hour,
+        newTime.minute,
+      );
+      if (!oneTimeDateTime.isAfter(DateTime.now())) {
+        _setSyncState(
+          _SyncStateType.error,
+          "One-time schedule must be set to a future date and time.",
+        );
+        _showSnack("Select a future date/time for one-time schedule.");
+        return;
+      }
+      newPlan = MedicinePlan.oneTime(date: pickedDate, time: newTime);
+    }
+
+    final updated = _schedule.withMedicinePlan(medicineNumber, newPlan);
     final wasDone = _takenToday[medicineNumber] ?? false;
-    final shouldClearDone = wasDone && _isTimeInFutureToday(newTime);
+    final shouldClearDone = wasDone && _isPlanInFuture(newPlan);
 
     await widget.scheduleStorage.saveSchedule(updated);
     if (shouldClearDone) {
@@ -253,19 +377,170 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
       if (shouldClearDone) {
         _takenToday[medicineNumber] = false;
       }
+      _deviceDueToday[medicineNumber] = false;
       _syncState = _SyncStateType.idle;
-      _syncStateMessage = "Schedule saved locally. Tap SYNC to update device.";
+      _syncStateMessage = "Saved locally. Tap SYNC to apply.";
     });
 
     if (shouldClearDone) {
       _showSnack(
-        "Medicine $medicineNumber status reset to Upcoming for today's new time.",
+        "Medicine $medicineNumber status reset to Upcoming for the new schedule.",
       );
     }
 
     await _schedulePhoneReminders(
       showExactAlarmDialog: false,
       successMessage: "Phone reminders updated for the new schedule.",
+    );
+  }
+
+  Future<MedicineScheduleMode?> _showScheduleTypeDialog(
+    MedicineScheduleMode currentMode,
+  ) async {
+    return showDialog<MedicineScheduleMode>(
+      context: context,
+      builder: (context) {
+        return Dialog(
+          insetPadding: const EdgeInsets.symmetric(
+            horizontal: 24,
+            vertical: 24,
+          ),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(18),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(18, 16, 18, 10),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  children: [
+                    Container(
+                      height: 34,
+                      width: 34,
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFEAF7EE),
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: const Icon(
+                        Icons.schedule_rounded,
+                        color: Color(0xFF2E7D32),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    const Expanded(
+                      child: Text(
+                        "Schedule Type",
+                        style: TextStyle(
+                          fontSize: 24,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 14),
+                _scheduleModeOption(
+                  mode: MedicineScheduleMode.daily,
+                  selectedMode: currentMode,
+                  title: "Daily",
+                  subtitle: "Repeats every day at the selected time",
+                  onTap: () =>
+                      Navigator.of(context).pop(MedicineScheduleMode.daily),
+                ),
+                const SizedBox(height: 10),
+                _scheduleModeOption(
+                  mode: MedicineScheduleMode.oneTime,
+                  selectedMode: currentMode,
+                  title: "One-time",
+                  subtitle: "Runs once on a specific date and time",
+                  onTap: () =>
+                      Navigator.of(context).pop(MedicineScheduleMode.oneTime),
+                ),
+                const SizedBox(height: 4),
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: TextButton(
+                    onPressed: () => Navigator.of(context).pop(),
+                    child: const Text("Cancel"),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _scheduleModeOption({
+    required MedicineScheduleMode mode,
+    required MedicineScheduleMode selectedMode,
+    required String title,
+    required String subtitle,
+    required VoidCallback onTap,
+  }) {
+    final isSelected = mode == selectedMode;
+    return Material(
+      color: isSelected ? const Color(0xFFEAF7EE) : const Color(0xFFF7F9F8),
+      borderRadius: BorderRadius.circular(14),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(14),
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(
+              color: isSelected
+                  ? const Color(0xFF2E7D32)
+                  : const Color(0x1A000000),
+              width: isSelected ? 1.4 : 1,
+            ),
+          ),
+          child: Row(
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title,
+                      style: TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.w700,
+                        color: isSelected
+                            ? const Color(0xFF1B5E20)
+                            : const Color(0xFF1F2328),
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      subtitle,
+                      style: const TextStyle(
+                        fontSize: 13,
+                        color: Color(0xFF5F6368),
+                        height: 1.25,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 10),
+              Icon(
+                isSelected
+                    ? Icons.check_circle_rounded
+                    : Icons.radio_button_unchecked_rounded,
+                color: isSelected
+                    ? const Color(0xFF2E7D32)
+                    : const Color(0xFF7B858E),
+                size: 28,
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 
@@ -279,7 +554,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
     }
 
     try {
-      await widget.notificationService.scheduleDailyReminders(
+      await widget.notificationService.scheduleReminders(
         _schedule,
         useExactAlarms: _useExactAlarms,
       );
@@ -291,8 +566,9 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
 
     setState(() {
       _takenToday = {1: false, 2: false, 3: false};
+      _deviceDueToday = {1: false, 2: false, 3: false};
       _syncState = _SyncStateType.idle;
-      _syncStateMessage = "Today's intake session has been reset.";
+      _syncStateMessage = "Today's status reset.";
     });
     _showSnack("Today's medicine intake status has been reset.");
   }
@@ -313,6 +589,11 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
     if (todayKey == _takenDateKey) {
       return;
     }
+    if (mounted) {
+      setState(() {
+        _deviceDueToday = {1: false, 2: false, 3: false};
+      });
+    }
     await _loadTakenStateForToday();
   }
 
@@ -320,64 +601,83 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
     if (_takenToday[medicineNumber] ?? false) {
       return;
     }
+    if (_markingInProgress.contains(medicineNumber)) {
+      return;
+    }
+
+    final status = _doseStatus(medicineNumber);
+    if (status != _DoseStatus.due) {
+      _showSnack("Medicine $medicineNumber can only be marked when status is Due.");
+      return;
+    }
 
     if (!mounted) {
       return;
     }
     setState(() {
-      _takenToday[medicineNumber] = true;
+      _markingInProgress.add(medicineNumber);
     });
 
-    await widget.scheduleStorage.saveTakenStateForDate(
-      _now,
-      medicineNumber: medicineNumber,
-      taken: true,
-    );
-
     try {
-      await widget.notificationService.cancelReminderForMedicine(
-        medicineNumber,
-      );
-      await widget.notificationService.scheduleReminderForMedicine(
-        medicineNumber,
-        _schedule.timeForMedicine(medicineNumber),
-        useExactAlarms: _useExactAlarms,
-        delaySeconds: 0,
-      );
-    } catch (_) {}
+      if (_isConnected) {
+        final ackResult = await _sendDeviceCommand(
+          "ACK,$medicineNumber",
+          commandName: "ACK",
+          requireAck: true,
+          timeout: const Duration(seconds: 3),
+          retryOnNoResponse: false,
+        );
+        if (!ackResult.isSuccess) {
+          _showSnack(
+            "Failed to close compartment for medicine $medicineNumber: "
+            "${ackResult.errorMessage ?? "unknown error"}",
+          );
+          return;
+        }
+      }
 
-    if (!_isConnected) {
-      _showSnack(
-        "Medicine $medicineNumber marked as taken. "
-        "Reconnect later if you also want to send close command to device.",
+      await widget.scheduleStorage.saveTakenStateForDate(
+        _now,
+        medicineNumber: medicineNumber,
+        taken: true,
       );
-      return;
-    }
 
-    final ackResult = await _sendDeviceCommand(
-      "ACK,$medicineNumber",
-      commandName: "ACK",
-      requireAck: true,
-      allowNoAckIfSent: true,
-      timeout: const Duration(seconds: 2),
-      retryOnNoResponse: false,
-    );
-    if (!ackResult.isSuccess) {
-      _showSnack(
-        "Medicine $medicineNumber marked as taken, "
-        "but failed to close compartment: "
-        "${ackResult.errorMessage ?? "unknown error"}",
-      );
-      return;
-    }
+      if (mounted) {
+        setState(() {
+          _takenToday[medicineNumber] = true;
+          _deviceDueToday[medicineNumber] = false;
+        });
+      }
 
-    if (ackResult.ackReceived) {
-      _showSnack("Medicine $medicineNumber marked as taken.");
-    } else {
-      _showSnack(
-        "Medicine $medicineNumber marked as taken. "
-        "Close command sent to device (no ACK line received).",
-      );
+      try {
+        await widget.notificationService.cancelReminderForMedicine(
+          medicineNumber,
+        );
+        final plan = _schedule.planForMedicine(medicineNumber);
+        if (plan.isDaily) {
+          await widget.notificationService.scheduleReminderForPlan(
+            medicineNumber,
+            plan,
+            useExactAlarms: _useExactAlarms,
+            delaySeconds: 0,
+          );
+        }
+      } catch (_) {}
+
+      if (_isConnected) {
+        _showSnack("Medicine $medicineNumber marked as taken.");
+      } else {
+        _showSnack(
+          "Medicine $medicineNumber marked as taken (phone only). "
+          "Connect later to sync device state.",
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _markingInProgress.remove(medicineNumber);
+        });
+      }
     }
   }
 
@@ -410,7 +710,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
 
       _useExactAlarms = permissionState.exactAlarmGranted;
 
-      await widget.notificationService.scheduleDailyReminders(
+      await widget.notificationService.scheduleReminders(
         _schedule,
         useExactAlarms: true,
       );
@@ -446,7 +746,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
       _syncing = true;
       _syncState = _SyncStateType.syncing;
       _syncStateMessage = connectedAtStart
-          ? "Syncing device and phone reminders..."
+          ? "Syncing phone and device..."
           : "Saving phone reminders...";
     });
 
@@ -489,7 +789,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
       if (!connectedAtStart) {
         _setSyncState(
           _SyncStateType.success,
-          "Phone reminders are active. Connect to device later to sync pillbox.",
+          "Phone reminders are active. Connect later to sync the pillbox.",
         );
         return;
       }
@@ -519,10 +819,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
 
   Future<(String?, String?)> _syncDeviceClockAndSchedule() async {
     if (!_isConnected) {
-      return (
-        "device is not connected. Reconnect and tap SYNC to retry.",
-        null,
-      );
+      return ("device is not connected. Reconnect and tap SYNC again.", null);
     }
 
     final now = DateTime.now();
@@ -530,7 +827,8 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
     final timeResult = await _sendDeviceCommand(
       timeCommand,
       commandName: "TIME",
-      timeout: const Duration(seconds: 1),
+      requireAck: true,
+      timeout: const Duration(seconds: 2),
       retryOnNoResponse: false,
     );
     if (!timeResult.isSuccess) {
@@ -538,8 +836,9 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
     }
 
     final syncResult = await _sendDeviceCommand(
-      _schedule.toSyncCommand(),
+      _schedule.toLegacyDailySyncCommand(),
       commandName: "SYNC",
+      requireAck: true,
     );
     if (!syncResult.isSuccess) {
       return (syncResult.errorMessage, null);
@@ -547,27 +846,42 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
 
     _lastSync = DateTime.now();
     await widget.scheduleStorage.saveLastSync(_lastSync!);
-    final ackWarning = (!timeResult.ackReceived || !syncResult.ackReceived)
-        ? "No ACK received from device for at least one command; "
-              "please verify time/schedule on LCD."
-        : null;
-    return (null, ackWarning);
+    if (_schedule.hasOneTimeSchedule) {
+      return (
+        null,
+        "Device synced with daily fallback. Current device firmware cannot "
+            "store date-based one-time schedules (hardware/firmware limitation), "
+            "so one-time slots were sent as daily HH:MM times.",
+      );
+    }
+    return (null, null);
   }
 
   Future<_DeviceCommandResult> _sendDeviceCommand(
     String command, {
     required String commandName,
     bool requireAck = false,
-    bool allowNoAckIfSent = false,
     Duration timeout = const Duration(seconds: 8),
     bool retryOnNoResponse = true,
   }) async {
+    final expectedOkLine = "OK,${commandName.toUpperCase()}";
+    bool matcher(String line) {
+      if (line.startsWith("ERR,")) {
+        return true;
+      }
+      if (line == "OK") {
+        return true;
+      }
+      return line == expectedOkLine;
+    }
+
     String? response;
     try {
       response = await widget.bluetoothService.sendCommandExpectingLine(
         command,
         timeout: timeout,
         retryOnNoResponse: retryOnNoResponse,
+        acceptResponse: matcher,
       );
     } catch (_) {
       response = null;
@@ -584,29 +898,21 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
       return _DeviceCommandResult(
         sent: true,
         ackReceived: true,
-        errorMessage: "$commandName failed ($response). Tap SYNC to retry.",
+        errorMessage: "$commandName failed ($response). Tap SYNC again.",
       );
     }
 
-    final sent = await widget.bluetoothService.sendLine(command);
-    if (!sent) {
+    if (!widget.bluetoothService.isConnected) {
       return _DeviceCommandResult(
         sent: false,
         ackReceived: false,
         errorMessage:
             "device disconnected during $commandName sync. Reconnect and tap "
-            "SYNC to retry.",
+            "SYNC again.",
       );
     }
 
     if (requireAck) {
-      if (allowNoAckIfSent) {
-        return const _DeviceCommandResult(
-          sent: true,
-          ackReceived: false,
-          errorMessage: null,
-        );
-      }
       return _DeviceCommandResult(
         sent: true,
         ackReceived: false,
@@ -631,9 +937,9 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
           title: const Text("Overwrite device schedule?"),
           content: Text(
             "This will replace the device schedule with:\n"
-            "Medicine 1: ${_schedule.medicine1.to24HourString()}\n"
-            "Medicine 2: ${_schedule.medicine2.to24HourString()}\n"
-            "Medicine 3: ${_schedule.medicine3.to24HourString()}",
+            "Medicine 1: ${_planSummary(_schedule.medicine1)}\n"
+            "Medicine 2: ${_planSummary(_schedule.medicine2)}\n"
+            "Medicine 3: ${_planSummary(_schedule.medicine3)}",
           ),
           actions: [
             TextButton(
@@ -702,62 +1008,121 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
   }
 
   String _connectionStatusText() {
-    if (!_isConnected) {
-      return "Not connected";
-    }
-    final address =
-        widget.bluetoothService.lastAddress ?? BluetoothService.deviceName;
-    return "Connected to $address";
+    return _isConnected ? "Connected" : "Not Connected";
+  }
+
+  Widget _connectionBadge({required bool compact}) {
+    final connected = _isConnected;
+    final bg = connected ? const Color(0xFFE7F6EC) : const Color(0xFFFDEDED);
+    final border = connected
+        ? const Color(0x552E7D32)
+        : const Color(0x55B71C1C);
+    final fg = connected ? const Color(0xFF1B5E20) : const Color(0xFFB71C1C);
+
+    return Container(
+      padding: EdgeInsets.symmetric(
+        horizontal: compact ? 10 : 12,
+        vertical: compact ? 6 : 8,
+      ),
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: border),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            connected ? Icons.bluetooth_connected : Icons.bluetooth_disabled,
+            color: fg,
+            size: compact ? 15 : 17,
+          ),
+          SizedBox(width: compact ? 6 : 8),
+          Flexible(
+            child: Text(
+              _connectionStatusText(),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: fg,
+                fontWeight: FontWeight.w800,
+                fontSize: compact ? 12 : 13,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   _DoseStatus _doseStatus(int medicineNumber) {
-    final time = _schedule.timeForMedicine(medicineNumber);
-    final scheduledDateTime = DateTime(
-      _now.year,
-      _now.month,
-      _now.day,
-      time.hour,
-      time.minute,
-    );
-
     if (_takenToday[medicineNumber] ?? false) {
       return _DoseStatus.done;
     }
-    if (_now.isBefore(scheduledDateTime.add(_dueGracePeriod))) {
-      return _DoseStatus.upcoming;
+    if (_deviceDueToday[medicineNumber] ?? false) {
+      return _DoseStatus.due;
     }
-    return _DoseStatus.due;
-  }
 
-  bool _isTimeInFutureToday(DailyTime time) {
-    final scheduledDateTime = DateTime(
-      _now.year,
-      _now.month,
-      _now.day,
-      time.hour,
-      time.minute,
-    );
-    return scheduledDateTime.isAfter(_now);
-  }
-
-  _NextIntake _nextScheduledIntake() {
-    _NextIntake? next;
-    for (var medicineNumber = 1; medicineNumber <= 3; medicineNumber++) {
-      final time = _schedule.timeForMedicine(medicineNumber);
-      var scheduled = DateTime(
+    final plan = _schedule.planForMedicine(medicineNumber);
+    DateTime scheduledDateTime;
+    if (plan.isDaily) {
+      final time = plan.time;
+      scheduledDateTime = DateTime(
         _now.year,
         _now.month,
         _now.day,
         time.hour,
         time.minute,
       );
-      if (!scheduled.isAfter(_now)) {
-        scheduled = scheduled.add(const Duration(days: 1));
+    } else {
+      final oneTime = plan.oneTimeDateTime();
+      if (oneTime == null) {
+        return _DoseStatus.upcoming;
+      }
+      final startOfToday = DateTime(_now.year, _now.month, _now.day);
+      if (oneTime.isBefore(startOfToday)) {
+        return _DoseStatus.done;
+      }
+      scheduledDateTime = oneTime;
+    }
+
+    if (_now.isBefore(scheduledDateTime.add(_dueGracePeriod))) {
+      return _DoseStatus.upcoming;
+    }
+    return _DoseStatus.due;
+  }
+
+  bool _isPlanInFuture(MedicinePlan plan) {
+    if (plan.isDaily) {
+      final scheduledDateTime = DateTime(
+        _now.year,
+        _now.month,
+        _now.day,
+        plan.time.hour,
+        plan.time.minute,
+      );
+      return scheduledDateTime.isAfter(_now);
+    }
+
+    final oneTime = plan.oneTimeDateTime();
+    if (oneTime == null) {
+      return false;
+    }
+    return oneTime.isAfter(_now);
+  }
+
+  _NextIntake? _nextScheduledIntake() {
+    _NextIntake? next;
+    for (var medicineNumber = 1; medicineNumber <= 3; medicineNumber++) {
+      final plan = _schedule.planForMedicine(medicineNumber);
+      final scheduled = plan.nextOccurrence(_now);
+      if (scheduled == null) {
+        continue;
       }
 
       final candidate = _NextIntake(
         medicineNumber: medicineNumber,
-        time: time,
+        plan: plan,
         dateTime: scheduled,
       );
 
@@ -765,7 +1130,119 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
         next = candidate;
       }
     }
-    return next!;
+    return next;
+  }
+
+  List<int> _missedDoseMedicines() {
+    final missed = <int>[];
+    for (var medicineNumber = 1; medicineNumber <= 3; medicineNumber++) {
+      if (_doseStatus(medicineNumber) == _DoseStatus.due) {
+        missed.add(medicineNumber);
+      }
+    }
+    return missed;
+  }
+
+  String _queueScheduleLabel(int medicineNumber) {
+    final plan = _schedule.planForMedicine(medicineNumber);
+    final timeLabel = plan.time.to12HourString();
+    if (plan.isOneTime && plan.oneTimeDate != null) {
+      return "$timeLabel • ${_formatDate(plan.oneTimeDate!)}";
+    }
+    return timeLabel;
+  }
+
+  Widget _missedDoseQueueCard(
+    List<int> missedMedicines, {
+    required bool compact,
+  }) {
+    if (missedMedicines.isEmpty) {
+      return const SizedBox.shrink();
+    }
+
+    return Container(
+      padding: EdgeInsets.all(compact ? 10 : 12),
+      decoration: BoxDecoration(
+        color: const Color(0xFFFFF4F2),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: const Color(0x33B71C1C)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.error_outline_rounded, color: Color(0xFFB71C1C)),
+              SizedBox(width: compact ? 6 : 8),
+              Text(
+                "Missed Dose Queue",
+                style: TextStyle(
+                  fontSize: compact ? 13 : 14,
+                  fontWeight: FontWeight.w800,
+                  color: const Color(0xFFB71C1C),
+                ),
+              ),
+            ],
+          ),
+          SizedBox(height: compact ? 8 : 10),
+          for (var i = 0; i < missedMedicines.length; i++) ...[
+            Container(
+              padding: EdgeInsets.symmetric(
+                horizontal: compact ? 8 : 10,
+                vertical: compact ? 6 : 8,
+              ),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: const Color(0x1AB71C1C)),
+              ),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          "Medicine ${missedMedicines[i]}",
+                          style: TextStyle(
+                            fontSize: compact ? 13 : 14,
+                            fontWeight: FontWeight.w700,
+                            color: const Color(0xFF9C1A1A),
+                          ),
+                        ),
+                        SizedBox(height: compact ? 1 : 2),
+                        Text(
+                          _queueScheduleLabel(missedMedicines[i]),
+                          style: TextStyle(
+                            fontSize: compact ? 11 : 12,
+                            color: const Color(0xFF5F6368),
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  FilledButton.tonal(
+                    onPressed: () => _markDoseAsTaken(missedMedicines[i]),
+                    style: FilledButton.styleFrom(
+                      foregroundColor: const Color(0xFF1B5E20),
+                      backgroundColor: const Color(0xFFE5F3E8),
+                      textStyle: TextStyle(
+                        fontSize: compact ? 11 : 12,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    child: const Text("Mark Taken"),
+                  ),
+                ],
+              ),
+            ),
+            if (i < missedMedicines.length - 1)
+              SizedBox(height: compact ? 6 : 8),
+          ],
+        ],
+      ),
+    );
   }
 
   String _formatCountdown(Duration duration) {
@@ -798,15 +1275,31 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const FittedBox(
+        centerTitle: true,
+        title: FittedBox(
           fit: BoxFit.scaleDown,
-          alignment: Alignment.centerLeft,
-          child: Text(
-            "Smart Medicine Reminder",
-            style: TextStyle(
-              fontSize: 20,
-              fontWeight: FontWeight.w900,
-              letterSpacing: 0.4,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+            decoration: BoxDecoration(
+              color: Colors.white.withValues(alpha: 0.16),
+              borderRadius: BorderRadius.circular(999),
+              border: Border.all(color: Colors.white.withValues(alpha: 0.18)),
+            ),
+            child: const Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.medication_outlined, size: 18, color: Colors.white),
+                SizedBox(width: 8),
+                Text(
+                  "Smart Medicine Reminder",
+                  style: TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.w800,
+                    letterSpacing: 0.3,
+                    color: Colors.white,
+                  ),
+                ),
+              ],
             ),
           ),
         ),
@@ -817,10 +1310,12 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
         child: SafeArea(
           child: LayoutBuilder(
             builder: (context, constraints) {
-              final compact = constraints.maxHeight < 700;
-              final pagePadding = compact ? 10.0 : 16.0;
+              final compact = constraints.maxHeight < 760;
+              final veryCompact = constraints.maxHeight < 640;
+              final pagePadding = compact ? 8.0 : 12.0;
               final sectionGap = compact ? 8.0 : 12.0;
               final syncButtonHeight = compact ? 48.0 : 54.0;
+              final missedMedicines = _missedDoseMedicines();
 
               final content = Padding(
                 padding: EdgeInsets.all(pagePadding),
@@ -830,11 +1325,15 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
                     _clockCard(compact: compact),
                     SizedBox(height: sectionGap),
                     _statusCard(compact: compact),
+                    if (missedMedicines.isNotEmpty) ...[
+                      SizedBox(height: sectionGap),
+                      _missedDoseQueueCard(missedMedicines, compact: compact),
+                    ],
                     SizedBox(height: sectionGap),
                     _medicineRow(1, compact: compact),
                     _medicineRow(2, compact: compact),
                     _medicineRow(3, compact: compact),
-                    SizedBox(height: compact ? 8 : 10),
+                    SizedBox(height: compact ? 10 : 12),
                     ElevatedButton(
                       onPressed: _syncing ? null : _syncSchedule,
                       style: ElevatedButton.styleFrom(
@@ -849,33 +1348,31 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
                               child: CircularProgressIndicator(strokeWidth: 2),
                             )
                           : Text(
-                              "SYNC / SAVE TO DEVICE",
+                              "SYNC",
                               style: TextStyle(
                                 fontSize: compact ? 14 : 16,
                                 fontWeight: FontWeight.w700,
                               ),
                             ),
                     ),
-                    if (!compact) ...[
-                      const SizedBox(height: 8),
-                      const Text(
-                        "Use Connect tab for Bluetooth pairing and connection.",
-                        textAlign: TextAlign.center,
-                        style: TextStyle(fontSize: 12, color: Colors.black54),
-                      ),
-                    ],
                   ],
                 ),
               );
 
-              return Align(
-                alignment: Alignment.topCenter,
-                child: FittedBox(
-                  fit: BoxFit.scaleDown,
+              if (veryCompact) {
+                return Align(
                   alignment: Alignment.topCenter,
-                  child: SizedBox(width: constraints.maxWidth, child: content),
-                ),
-              );
+                  child: FittedBox(
+                    fit: BoxFit.scaleDown,
+                    alignment: Alignment.topCenter,
+                    child: SizedBox(
+                      width: constraints.maxWidth,
+                      child: content,
+                    ),
+                  ),
+                );
+              }
+              return content;
             },
           ),
         ),
@@ -885,9 +1382,41 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
 
   Widget _clockCard({required bool compact}) {
     final nextIntake = _nextScheduledIntake();
-    final countdown = _formatCountdown(nextIntake.dateTime.difference(_now));
-    final isToday = _dateKey(nextIntake.dateTime) == _dateKey(_now);
-    final dayLabel = isToday ? "Today" : "Tomorrow";
+    if (nextIntake == null) {
+      return Container(
+        padding: EdgeInsets.all(compact ? 10 : 14),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: Text(
+          "No upcoming schedule. Set at least one future medicine time.",
+          style: TextStyle(
+            fontSize: compact ? 12 : 13,
+            color: const Color(0xFF2F5F45),
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      );
+    }
+
+    final remaining = nextIntake.dateTime.difference(_now);
+    final countdown = _formatCountdown(remaining);
+    final scheduleTypeLabel = nextIntake.plan.isDaily ? "Daily" : "One-time";
+    final friendlyDate = _formatFriendlyDate(nextIntake.dateTime);
+    final timeLabel = nextIntake.plan.time.to12HourString();
+    final hasMissedDue = _missedDoseMedicines().isNotEmpty;
+    final ringProgress = hasMissedDue
+        ? 1.0
+        : _nextDoseProgress(nextIntake, remaining);
+    final ringColor = hasMissedDue
+        ? const Color(0xFFB71C1C)
+        : const Color(0xFF2E7D32);
+    final ringIcon = hasMissedDue
+        ? Icons.warning_amber_rounded
+        : Icons.access_time_filled_rounded;
+    final ringLabel = hasMissedDue ? "Due" : "On track";
+    final ringSize = compact ? 74.0 : 84.0;
 
     return Container(
       padding: EdgeInsets.all(compact ? 10 : 14),
@@ -895,40 +1424,149 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
         color: Colors.white,
         borderRadius: BorderRadius.circular(12),
       ),
-      child: Column(
+      child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            "Next Scheduled Intake",
-            style: TextStyle(
-              fontSize: compact ? 12 : 13,
-              color: const Color(0xFF2F5F45),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  "Next Dose",
+                  style: TextStyle(
+                    fontSize: compact ? 12 : 13,
+                    color: const Color(0xFF2F5F45),
+                  ),
+                ),
+                SizedBox(height: compact ? 4 : 6),
+                Text(
+                  "Medicine ${nextIntake.medicineNumber} • $scheduleTypeLabel",
+                  style: TextStyle(
+                    fontSize: compact ? 12 : 13,
+                    fontWeight: FontWeight.w600,
+                    color: const Color(0xFF1F4F37),
+                  ),
+                ),
+                SizedBox(height: compact ? 3 : 5),
+                Text(
+                  "$friendlyDate · $timeLabel",
+                  style: TextStyle(
+                    fontSize: compact ? 12 : 13,
+                    color: Colors.black87,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                SizedBox(height: compact ? 8 : 10),
+                Text(
+                  "Starts in",
+                  style: TextStyle(
+                    fontSize: compact ? 11 : 12,
+                    color: Colors.black54,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                SizedBox(height: compact ? 2 : 3),
+                Text(
+                  countdown,
+                  style: TextStyle(
+                    fontSize: compact ? 24 : 28,
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: 1.2,
+                  ),
+                ),
+              ],
             ),
           ),
-          SizedBox(height: compact ? 2 : 4),
-          Text(
-            "Medicine ${nextIntake.medicineNumber} • ${nextIntake.time.to24HourString()} • $dayLabel",
-            style: TextStyle(
-              fontSize: compact ? 12 : 13,
-              fontWeight: FontWeight.w600,
-              color: const Color(0xFF1F4F37),
-            ),
-          ),
-          SizedBox(height: compact ? 2 : 4),
-          Text(
-            countdown,
-            style: TextStyle(
-              fontSize: compact ? 24 : 28,
-              fontWeight: FontWeight.bold,
-              letterSpacing: 1.2,
-            ),
+          SizedBox(width: compact ? 10 : 12),
+          Column(
+            children: [
+              SizedBox(
+                width: ringSize,
+                height: ringSize,
+                child: Stack(
+                  alignment: Alignment.center,
+                  children: [
+                    SizedBox(
+                      width: ringSize,
+                      height: ringSize,
+                      child: CircularProgressIndicator(
+                        value: ringProgress,
+                        strokeWidth: compact ? 6 : 7,
+                        backgroundColor: const Color(0xFFE5ECE7),
+                        valueColor: AlwaysStoppedAnimation<Color>(ringColor),
+                      ),
+                    ),
+                    Icon(ringIcon, color: ringColor, size: compact ? 28 : 30),
+                  ],
+                ),
+              ),
+              SizedBox(height: compact ? 4 : 6),
+              Text(
+                ringLabel,
+                style: TextStyle(
+                  fontSize: compact ? 11 : 12,
+                  fontWeight: FontWeight.w700,
+                  color: ringColor,
+                ),
+              ),
+            ],
           ),
         ],
       ),
     );
   }
 
+  double _nextDoseProgress(_NextIntake nextIntake, Duration remaining) {
+    if (remaining <= Duration.zero) {
+      return 1.0;
+    }
+
+    Duration totalWindow;
+    if (nextIntake.plan.isDaily) {
+      totalWindow = const Duration(hours: 24);
+    } else {
+      final startOfToday = DateTime(_now.year, _now.month, _now.day);
+      totalWindow = nextIntake.dateTime.difference(startOfToday);
+      if (totalWindow <= Duration.zero) {
+        totalWindow = const Duration(hours: 24);
+      }
+    }
+
+    final elapsed = totalWindow - remaining;
+    if (totalWindow.inMilliseconds <= 0) {
+      return 0.0;
+    }
+    final progress = elapsed.inMilliseconds / totalWindow.inMilliseconds;
+    if (progress.isNaN) {
+      return 0.0;
+    }
+    return progress.clamp(0.0, 1.0);
+  }
+
+  String _formatFriendlyDate(DateTime dateTime) {
+    const weekdays = <String>["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const months = <String>[
+      "Jan",
+      "Feb",
+      "Mar",
+      "Apr",
+      "May",
+      "Jun",
+      "Jul",
+      "Aug",
+      "Sep",
+      "Oct",
+      "Nov",
+      "Dec",
+    ];
+
+    final weekday = weekdays[dateTime.weekday - 1];
+    final month = months[dateTime.month - 1];
+    return "$weekday, $month ${dateTime.day}";
+  }
+
   Widget _statusCard({required bool compact}) {
+    final resetButton = _resetTodayButton(compact: compact);
     return Container(
       padding: EdgeInsets.all(compact ? 10 : 12),
       decoration: BoxDecoration(
@@ -940,52 +1578,42 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
         children: [
           Row(
             children: [
-              Expanded(
-                child: Text(
-                  _connectionStatusText(),
-                  style: TextStyle(
-                    fontWeight: FontWeight.w700,
-                    fontSize: compact ? 13 : 14,
-                  ),
-                ),
-              ),
-              TextButton(
-                onPressed: _syncing ? null : _resetTodaySession,
-                style: TextButton.styleFrom(
-                  padding: EdgeInsets.symmetric(
-                    horizontal: compact ? 8 : 10,
-                    vertical: compact ? 4 : 6,
-                  ),
-                  minimumSize: Size.zero,
-                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                ),
-                child: Text(
-                  "Reset Today",
-                  style: TextStyle(
-                    fontSize: compact ? 11 : 12,
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
-              ),
+              Expanded(child: _connectionBadge(compact: compact)),
+              SizedBox(width: compact ? 8 : 10),
+              FittedBox(fit: BoxFit.scaleDown, child: resetButton),
             ],
           ),
-          SizedBox(height: compact ? 3 : 4),
-          Text(
-            _lastSync == null
-                ? "Last sync: never"
-                : "Last sync: ${_formatDateTime(_lastSync!)}",
-            style: TextStyle(
-              color: Colors.black54,
-              fontSize: compact ? 12 : 13,
+          SizedBox(height: compact ? 6 : 8),
+          Padding(
+            padding: EdgeInsets.symmetric(horizontal: compact ? 10 : 12),
+            child: Text(
+              _lastSync == null
+                  ? "Last sync: never"
+                  : "Last sync: ${_formatDateTime(_lastSync!)}",
+              style: TextStyle(
+                color: Colors.black54,
+                fontSize: compact ? 12 : 13,
+              ),
             ),
           ),
-          SizedBox(height: compact ? 4 : 6),
-          Text(
-            _syncStateMessage,
-            style: TextStyle(
-              color: _syncMessageColor(),
-              fontWeight: FontWeight.w600,
-              fontSize: compact ? 12 : 13,
+          SizedBox(height: compact ? 8 : 10),
+          Container(
+            width: double.infinity,
+            padding: EdgeInsets.symmetric(
+              horizontal: compact ? 10 : 12,
+              vertical: compact ? 8 : 9,
+            ),
+            decoration: BoxDecoration(
+              color: const Color(0xFFF4F8F5),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Text(
+              _syncStateMessage,
+              style: TextStyle(
+                color: _syncMessageColor(),
+                fontWeight: FontWeight.w600,
+                fontSize: compact ? 12 : 13,
+              ),
             ),
           ),
         ],
@@ -993,78 +1621,197 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
     );
   }
 
+  Widget _resetTodayButton({required bool compact}) {
+    return OutlinedButton.icon(
+      onPressed: _syncing ? null : _resetTodaySession,
+      style: OutlinedButton.styleFrom(
+        foregroundColor: const Color(0xFF2E7D32),
+        side: const BorderSide(color: Color(0x552E7D32)),
+        backgroundColor: const Color(0x0F2E7D32),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(999)),
+        padding: EdgeInsets.symmetric(
+          horizontal: compact ? 10 : 12,
+          vertical: compact ? 6 : 7,
+        ),
+        minimumSize: const Size(0, 0),
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        visualDensity: VisualDensity.compact,
+      ),
+      icon: Icon(Icons.refresh_rounded, size: compact ? 14 : 15),
+      label: Text(
+        "Reset Today",
+        style: TextStyle(
+          fontSize: compact ? 11 : 12,
+          fontWeight: FontWeight.w700,
+        ),
+      ),
+    );
+  }
+
   Widget _medicineRow(int medicineNumber, {required bool compact}) {
-    final time = _schedule.timeForMedicine(medicineNumber);
+    final plan = _schedule.planForMedicine(medicineNumber);
+    final time = plan.time;
     final status = _doseStatus(medicineNumber);
     final isDue = status == _DoseStatus.due;
+    final oneTimeDate = plan.isOneTime ? plan.oneTimeDate : null;
     const dueTextColor = Color(0xFFB71C1C);
+    final setButtonWidth = compact ? 70.0 : 76.0;
+    final timeColumnWidth = compact ? 92.0 : 104.0;
+    final checkColumnWidth = compact ? 34.0 : 38.0;
+    final rowGap = compact ? 6.0 : 8.0;
 
     return Container(
-      margin: EdgeInsets.only(bottom: compact ? 8 : 10),
+      margin: EdgeInsets.only(bottom: compact ? 6 : 8),
+      constraints: BoxConstraints(minHeight: compact ? 82 : 90),
       padding: EdgeInsets.symmetric(
-        horizontal: compact ? 10 : 12,
-        vertical: compact ? 8 : 10,
+        horizontal: compact ? 6 : 8,
+        vertical: compact ? 6 : 8,
       ),
       decoration: BoxDecoration(
         color: Colors.white,
-        borderRadius: BorderRadius.circular(12),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: const Color(0x1A000000), width: 0.8),
       ),
       child: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
         children: [
-          ElevatedButton(
-            onPressed: () => _pickTimeForMedicine(medicineNumber),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: const Color(0xFF2E7D32),
-              foregroundColor: Colors.white,
-              textStyle: TextStyle(
-                fontWeight: FontWeight.w700,
-                fontSize: compact ? 12 : 14,
+          SizedBox(
+            width: setButtonWidth,
+            child: ElevatedButton(
+              onPressed: () => _configureMedicinePlan(medicineNumber),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFF2E7D32),
+                foregroundColor: Colors.white,
+                minimumSize: Size(setButtonWidth, compact ? 38 : 40),
+                padding: EdgeInsets.zero,
+                textStyle: TextStyle(
+                  fontWeight: FontWeight.w700,
+                  fontSize: compact ? 11 : 13,
+                ),
               ),
+              child: const Text("SET"),
             ),
-            child: const Text("SET"),
           ),
-          SizedBox(width: compact ? 8 : 12),
+          SizedBox(width: rowGap),
           Expanded(
-            child: Center(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.center,
-                children: [
-                  Text(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                FittedBox(
+                  fit: BoxFit.scaleDown,
+                  child: Text(
                     "Medicine $medicineNumber",
                     textAlign: TextAlign.center,
+                    maxLines: 1,
+                    softWrap: false,
                     style: TextStyle(
-                      fontSize: compact ? 14 : 16,
+                      fontSize: compact ? 13 : 15,
                       fontWeight: FontWeight.w700,
                       color: isDue ? dueTextColor : null,
                     ),
                   ),
-                  const SizedBox(height: 2),
-                  _statusChip(status, compact: compact),
-                ],
-              ),
+                ),
+                SizedBox(height: compact ? 1 : 2),
+                Text(
+                  _planLabel(plan),
+                  textAlign: TextAlign.center,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: compact ? 10 : 11,
+                    color: Colors.black54,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                SizedBox(height: compact ? 5 : 6),
+                _statusChip(status, compact: compact),
+              ],
             ),
           ),
-          Text(
-            time.to24HourString(),
-            style: TextStyle(
-              fontSize: compact ? 20 : 22,
-              fontWeight: FontWeight.bold,
-              color: isDue ? dueTextColor : null,
+          SizedBox(width: rowGap),
+          SizedBox(
+            width: timeColumnWidth,
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                FittedBox(
+                  fit: BoxFit.scaleDown,
+                  child: Text(
+                    time.to12HourString(),
+                    maxLines: 1,
+                    softWrap: false,
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      fontSize: compact ? 18 : 20,
+                      fontWeight: FontWeight.bold,
+                      color: isDue ? dueTextColor : null,
+                    ),
+                  ),
+                ),
+                SizedBox(height: compact ? 1 : 2),
+                SizedBox(
+                  height: compact ? 13 : 15,
+                  child: oneTimeDate == null
+                      ? null
+                      : Text(
+                          _formatDate(oneTimeDate),
+                          textAlign: TextAlign.center,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: compact ? 9 : 10,
+                            color: Colors.black54,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                ),
+              ],
             ),
           ),
-          if (status != _DoseStatus.done) ...[
-            const SizedBox(width: 4),
-            IconButton(
-              onPressed: () => _markDoseAsTaken(medicineNumber),
-              tooltip: "Mark Medicine $medicineNumber as taken",
-              icon: const Icon(Icons.check_circle),
-              color: const Color(0xFF1B5E20),
-              splashRadius: 18,
-              visualDensity: VisualDensity.compact,
-              constraints: const BoxConstraints.tightFor(width: 32, height: 32),
-              padding: EdgeInsets.zero,
+          SizedBox(width: rowGap),
+          Container(
+            width: checkColumnWidth,
+            padding: const EdgeInsets.symmetric(vertical: 4),
+            decoration: BoxDecoration(
+              color: const Color(0xFFF1F7F2),
+              borderRadius: BorderRadius.circular(8),
             ),
-          ],
+            child: Center(
+              child: Visibility(
+                visible: status != _DoseStatus.done,
+                maintainAnimation: true,
+                maintainSize: true,
+                maintainState: true,
+                child: _markingInProgress.contains(medicineNumber)
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : IconButton(
+                        onPressed: status == _DoseStatus.due
+                            ? () => _markDoseAsTaken(medicineNumber)
+                            : null,
+                        tooltip: status == _DoseStatus.due
+                            ? "Mark Medicine $medicineNumber as taken"
+                            : "Available when status is Due",
+                        icon: const Icon(Icons.check_circle),
+                        color: status == _DoseStatus.due
+                            ? const Color(0xFF1B5E20)
+                            : const Color(0x802E7D32),
+                        splashRadius: 18,
+                        visualDensity: VisualDensity.compact,
+                        constraints: const BoxConstraints.tightFor(
+                          width: 32,
+                          height: 32,
+                        ),
+                        padding: EdgeInsets.zero,
+                      ),
+                ),
+            ),
+          ),
         ],
       ),
     );
@@ -1094,6 +1841,8 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
     }
 
     return Container(
+      alignment: Alignment.center,
+      constraints: BoxConstraints(minWidth: compact ? 76 : 88),
       padding: EdgeInsets.symmetric(
         horizontal: compact ? 8 : 10,
         vertical: compact ? 2 : 3,
@@ -1111,6 +1860,24 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
         ),
       ),
     );
+  }
+
+  String _planLabel(MedicinePlan plan) {
+    if (plan.isDaily) {
+      return "Daily";
+    }
+    return "One-time";
+  }
+
+  String _planSummary(MedicinePlan plan) {
+    if (plan.isDaily) {
+      return "Daily at ${plan.time.to12HourString()}";
+    }
+    final date = plan.oneTimeDate;
+    if (date == null) {
+      return "One-time at ${plan.time.to12HourString()}";
+    }
+    return "One-time ${_formatDate(date)} ${plan.time.to12HourString()}";
   }
 
   String _formatDate(DateTime dateTime) {

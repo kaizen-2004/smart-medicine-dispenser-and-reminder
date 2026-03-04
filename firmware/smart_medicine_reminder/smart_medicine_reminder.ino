@@ -1,37 +1,48 @@
 #include <Arduino.h>
 #include <BluetoothSerial.h>
 #include <ESP32Servo.h>
+#include <HTTPUpdateServer.h>
 #include <LiquidCrystal_I2C.h>
 #include <Preferences.h>
 #include <RTClib.h>
+#include <WebServer.h>
+#include <WiFi.h>
 #include <Wire.h>
 
 #if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
 #error Bluetooth is not enabled. Please enable it in menuconfig.
 #endif
 
-namespace {
-constexpr const char *kDeviceName = "Smart-Medicine-Reminder";
-constexpr uint8_t kServoPins[3] = {25, 26, 27};
-constexpr uint8_t kBuzzerPin = 14;
-constexpr uint8_t kAckButtonPin = 32;
-constexpr uint8_t kRefillButtonPin = 33;
-constexpr int kDefaultLockAngles[3] = {45, 45, 45};
-constexpr int kDefaultUnlockAngles[3] = {160, 160, 160};
-constexpr int kDefaultScheduleMinutes[3] = {8 * 60, 13 * 60, 20 * 60};
-constexpr size_t kMaxInboundLineLength = 128;
-constexpr uint8_t kLcdI2cAddress =
-    0x27; // Common LCD backpack address (use 0x3F if needed).
-constexpr uint32_t kDisplayRefreshMs = 1000;
-constexpr uint32_t kLcdRecoverIntervalMs = 30000;
-constexpr uint32_t kI2cClockHz = 50000;
-constexpr uint32_t kButtonDebounceMs = 35;
-constexpr uint32_t kRefillLongPressMs = 2000;
-constexpr bool kUsePassiveBuzzer = true;
-constexpr uint16_t kPassiveBuzzerFrequencyHz = 4000;
-constexpr uint32_t kBuzzerPatternOnMs = 180;
-constexpr uint32_t kBuzzerPatternOffMs = 220;
-constexpr bool kEnableSerialDebug = true;
+namespace
+{
+  constexpr const char *kDeviceName = "Smart-Medicine-Reminder";
+  constexpr uint8_t kServoPins[3] = {25, 26, 27};
+  constexpr uint8_t kBuzzerPin = 14;
+  constexpr uint8_t kAckButtonPin = 32;
+  constexpr uint8_t kRefillButtonPin = 33;
+  constexpr uint8_t kModeDaily = 0;
+  constexpr uint8_t kModeOneTime = 1;
+  constexpr int kDefaultLockAngles[3] = {45, 45, 45};
+  constexpr int kDefaultUnlockAngles[3] = {160, 160, 160};
+  constexpr int kDefaultScheduleMinutes[3] = {8 * 60, 13 * 60, 20 * 60};
+  constexpr size_t kMaxInboundLineLength = 128;
+  constexpr uint8_t kLcdI2cAddress =
+      0x27; // Common LCD backpack address (use 0x3F if needed).
+  constexpr uint32_t kDisplayRefreshMs = 1000;
+  constexpr uint32_t kSchedulerIntervalMs = 100;
+  constexpr uint32_t kLcdRecoverIntervalMs = 30000;
+  constexpr int kStartupCatchupWindowSec = 300;
+  constexpr uint32_t kI2cClockHz = 50000;
+  constexpr uint32_t kButtonDebounceMs = 35;
+  constexpr uint32_t kRefillLongPressMs = 2000;
+  constexpr bool kUsePassiveBuzzer = true;
+  constexpr uint16_t kPassiveBuzzerFrequencyHz = 4000;
+  constexpr uint32_t kBuzzerPatternOnMs = 180;
+  constexpr uint32_t kBuzzerPatternOffMs = 220;
+  constexpr const char *kOtaApSsidPrefix = "SMR-OTA-";
+  constexpr const char *kOtaWebUser = "smr";
+  constexpr uint32_t kOtaTimeoutMs = 10UL * 60UL * 1000UL;
+  constexpr bool kEnableSerialDebug = true;
 } // namespace
 
 BluetoothSerial serialBt;
@@ -39,6 +50,8 @@ Preferences preferences;
 RTC_DS3231 rtc;
 Servo servos[3];
 LiquidCrystal_I2C lcd(kLcdI2cAddress, 16, 2);
+WebServer otaServer(80);
+HTTPUpdateServer otaUpdater;
 
 int scheduleMinutes[3] = {
     kDefaultScheduleMinutes[0],
@@ -55,6 +68,11 @@ int unlockAngles[3] = {
     kDefaultUnlockAngles[1],
     kDefaultUnlockAngles[2],
 };
+uint8_t slotModes[3] = {kModeDaily, kModeDaily, kModeDaily};
+int oneTimeYear[3] = {0, 0, 0};
+int oneTimeMonth[3] = {0, 0, 0};
+int oneTimeDay[3] = {0, 0, 0};
+bool oneTimeConsumed[3] = {false, false, false};
 bool triggeredToday[3] = {false, false, false};
 bool dueActive[3] = {false, false, false};
 bool compartmentOpen[3] = {false, false, false};
@@ -67,14 +85,23 @@ bool scheduleConfigured = false;
 bool rtcAvailable = false;
 bool rtcConfigured = false;
 int lastDateKey = -1;
+int lastSecondOfDay = -1;
 uint32_t lastSchedulerTickMs = 0;
 uint32_t lastDisplayTickMs = 0;
 uint32_t lastLcdRecoverMs = 0;
 String inputBuffer;
 bool lastBtClientState = false;
 String lastLcdLines[2] = {"", ""};
+bool otaUpdateMode = false;
+bool otaServerStarted = false;
+bool otaCredentialsReady = false;
+uint32_t otaModeStartedMs = 0;
+String otaApSsid;
+String otaApPassword;
+String otaWebPassword;
 
-struct ButtonState {
+struct ButtonState
+{
   uint8_t pin;
   bool rawPressed;
   bool stablePressed;
@@ -86,14 +113,17 @@ struct ButtonState {
 ButtonState ackButton = {kAckButtonPin, false, false, 0, 0, false};
 ButtonState refillButton = {kRefillButtonPin, false, false, 0, 0, false};
 
-void debugLog(const String &line) {
-  if (!kEnableSerialDebug) {
+void debugLog(const String &line)
+{
+  if (!kEnableSerialDebug)
+  {
     return;
   }
   Serial.println(line);
 }
 
-void sendLine(const String &line) {
+void sendLine(const String &line)
+{
   serialBt.print(line);
   serialBt.print('\n');
   debugLog(String("BT_TX,") + line);
@@ -101,14 +131,40 @@ void sendLine(const String &line) {
 
 void sendError(const char *errorCode) { sendLine(String("ERR,") + errorCode); }
 
-bool parseDigits(const String &token, int digits, int &value) {
-  if (static_cast<int>(token.length()) != digits) {
+String otaChipSuffix()
+{
+  const uint32_t id = static_cast<uint32_t>(ESP.getEfuseMac() & 0xFFFF);
+  char buffer[5];
+  snprintf(buffer, sizeof(buffer), "%04X", id);
+  return String(buffer);
+}
+
+void initOtaCredentials()
+{
+  if (otaCredentialsReady)
+  {
+    return;
+  }
+
+  const String suffix = otaChipSuffix();
+  otaApSsid = String(kOtaApSsidPrefix) + suffix;
+  otaApPassword = String("SMR") + suffix + "88";   // >= 8 chars
+  otaWebPassword = String("upd") + suffix + "42!"; // >= 8 chars
+  otaCredentialsReady = true;
+}
+
+bool parseDigits(const String &token, int digits, int &value)
+{
+  if (static_cast<int>(token.length()) != digits)
+  {
     return false;
   }
 
   int result = 0;
-  for (int i = 0; i < digits; i++) {
-    if (!isDigit(token[i])) {
+  for (int i = 0; i < digits; i++)
+  {
+    if (!isDigit(token[i]))
+    {
       return false;
     }
     result = (result * 10) + (token[i] - '0');
@@ -118,19 +174,23 @@ bool parseDigits(const String &token, int digits, int &value) {
   return true;
 }
 
-bool parseHHMM(const String &value, int &minutesFromMidnight) {
-  if (value.length() != 5 || value[2] != ':') {
+bool parseHHMM(const String &value, int &minutesFromMidnight)
+{
+  if (value.length() != 5 || value[2] != ':')
+  {
     return false;
   }
 
   int hour = 0;
   int minute = 0;
   if (!parseDigits(value.substring(0, 2), 2, hour) ||
-      !parseDigits(value.substring(3, 5), 2, minute)) {
+      !parseDigits(value.substring(3, 5), 2, minute))
+  {
     return false;
   }
 
-  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59)
+  {
     return false;
   }
 
@@ -138,7 +198,8 @@ bool parseHHMM(const String &value, int &minutesFromMidnight) {
   return true;
 }
 
-String formatHHMM(int minutesFromMidnight) {
+String formatHHMM(int minutesFromMidnight)
+{
   const int hour = minutesFromMidnight / 60;
   const int minute = minutesFromMidnight % 60;
   char buffer[6];
@@ -146,19 +207,29 @@ String formatHHMM(int minutesFromMidnight) {
   return String(buffer);
 }
 
-String formatHHMMSS(const DateTime &dateTime) {
+String formatDateYMD(int year, int month, int day)
+{
+  char buffer[11];
+  snprintf(buffer, sizeof(buffer), "%04d-%02d-%02d", year, month, day);
+  return String(buffer);
+}
+
+String formatHHMMSS(const DateTime &dateTime)
+{
   char buffer[9];
   snprintf(buffer, sizeof(buffer), "%02d:%02d:%02d", dateTime.hour(),
            dateTime.minute(), dateTime.second());
   return String(buffer);
 }
 
-String formatTimeAmPm(int minutesFromMidnight) {
+String formatTimeAmPm(int minutesFromMidnight)
+{
   const int hour24 = (minutesFromMidnight / 60) % 24;
   const int minute = minutesFromMidnight % 60;
   const bool pm = hour24 >= 12;
   int hour12 = hour24 % 12;
-  if (hour12 == 0) {
+  if (hour12 == 0)
+  {
     hour12 = 12;
   }
 
@@ -168,24 +239,30 @@ String formatTimeAmPm(int minutesFromMidnight) {
   return String(buffer);
 }
 
-String toLcdLine(const String &value) {
-  if (value.length() >= 16) {
+String toLcdLine(const String &value)
+{
+  if (value.length() >= 16)
+  {
     return value.substring(0, 16);
   }
 
   String padded = value;
-  while (padded.length() < 16) {
+  while (padded.length() < 16)
+  {
     padded += ' ';
   }
   return padded;
 }
 
-void lcdPrintLine(uint8_t row, const String &value) {
-  if (row > 1) {
+void lcdPrintLine(uint8_t row, const String &value)
+{
+  if (row > 1)
+  {
     return;
   }
   const String formatted = toLcdLine(value);
-  if (lastLcdLines[row] == formatted) {
+  if (lastLcdLines[row] == formatted)
+  {
     return;
   }
   lcd.setCursor(0, row);
@@ -193,81 +270,136 @@ void lcdPrintLine(uint8_t row, const String &value) {
   lastLcdLines[row] = formatted;
 }
 
-void invalidateLcdCache() {
+void invalidateLcdCache()
+{
   lastLcdLines[0] = "";
   lastLcdLines[1] = "";
 }
 
-void initLcd() {
+void initLcd()
+{
   lcd.init();
   lcd.backlight();
   invalidateLcdCache();
 }
 
-int nextSlotIndexFor(const DateTime &now) {
-  const int minutesNow = (now.hour() * 60) + now.minute();
-  int chosenIndex = 0;
-  int smallestDelta = (24 * 60) + 1;
+bool hasValidOneTimeDate(int index)
+{
+  return oneTimeYear[index] >= 2000 && oneTimeMonth[index] >= 1 &&
+         oneTimeMonth[index] <= 12 && oneTimeDay[index] >= 1 &&
+         oneTimeDay[index] <= 31;
+}
 
-  for (int i = 0; i < 3; i++) {
-    int delta = scheduleMinutes[i] - minutesNow;
-    if (delta < 0 || (delta == 0 && now.second() > 0)) {
-      delta += (24 * 60);
+DateTime slotNextDateTime(int index, const DateTime &now)
+{
+  if (slotModes[index] == kModeOneTime)
+  {
+    if (!hasValidOneTimeDate(index) || oneTimeConsumed[index])
+    {
+      return DateTime(2099, 12, 31, 23, 59, 59);
     }
-    if (delta < smallestDelta) {
-      smallestDelta = delta;
+    const DateTime target = DateTime(oneTimeYear[index], oneTimeMonth[index],
+                                     oneTimeDay[index],
+                                     scheduleMinutes[index] / 60,
+                                     scheduleMinutes[index] % 60, 0);
+    if (target.unixtime() <= now.unixtime())
+    {
+      return DateTime(2099, 12, 31, 23, 59, 59);
+    }
+    return target;
+  }
+
+  DateTime scheduled = DateTime(now.year(), now.month(), now.day(),
+                                scheduleMinutes[index] / 60,
+                                scheduleMinutes[index] % 60, 0);
+  if (scheduled.unixtime() <= now.unixtime())
+  {
+    scheduled = scheduled + TimeSpan(1, 0, 0, 0);
+  }
+  return scheduled;
+}
+
+int nextSlotIndexFor(const DateTime &now)
+{
+  int chosenIndex = 0;
+  DateTime chosenDateTime = DateTime(2099, 12, 31, 23, 59, 59);
+
+  for (int i = 0; i < 3; i++)
+  {
+    const DateTime candidate = slotNextDateTime(i, now);
+    if (candidate.unixtime() < chosenDateTime.unixtime())
+    {
+      chosenDateTime = candidate;
       chosenIndex = i;
     }
   }
-
   return chosenIndex;
 }
 
-int dueActiveCount() {
+int dueActiveCount()
+{
   int count = 0;
-  for (int i = 0; i < 3; i++) {
-    if (dueActive[i]) {
+  for (int i = 0; i < 3; i++)
+  {
+    if (dueActive[i])
+    {
       count++;
     }
   }
   return count;
 }
 
-int firstDueActiveIndex() {
-  for (int i = 0; i < 3; i++) {
-    if (dueActive[i]) {
+int firstDueActiveIndex()
+{
+  for (int i = 0; i < 3; i++)
+  {
+    if (dueActive[i])
+    {
       return i;
     }
   }
   return -1;
 }
 
-void updateDisplay() {
-  if (refillMode) {
+void updateDisplay()
+{
+  if (otaUpdateMode)
+  {
+    lcdPrintLine(0, "Firmware Update");
+    lcdPrintLine(1, "Open 192.168.4.1");
+    return;
+  }
+
+  if (refillMode)
+  {
     lcdPrintLine(0, "Refill Mode ON");
     lcdPrintLine(1, "Hold B to close");
     return;
   }
 
-  if (!rtcAvailable || !rtcConfigured) {
+  if (!rtcAvailable || !rtcConfigured)
+  {
     lcdPrintLine(0, "Clock not ready");
     lcdPrintLine(1, "Call caregiver");
     return;
   }
 
-  if (!scheduleConfigured) {
+  if (!scheduleConfigured)
+  {
     lcdPrintLine(0, "Set times in app");
     lcdPrintLine(1, "Ask for help");
     return;
   }
 
   const int dueCount = dueActiveCount();
-  if (dueCount > 1) {
+  if (dueCount > 1)
+  {
     lcdPrintLine(0, "Time for meds");
     lcdPrintLine(1, "Press A to close");
     return;
   }
-  if (dueCount == 1) {
+  if (dueCount == 1)
+  {
     const int dueIndex = firstDueActiveIndex();
     lcdPrintLine(0, "Time for Med " + String(dueIndex + 1));
     lcdPrintLine(1, "Press A to close");
@@ -279,104 +411,162 @@ void updateDisplay() {
 
   lcdPrintLine(0, "Time " + formatHHMMSS(now));
   lcdPrintLine(1, "Next M" + String(nextIndex + 1) + " " +
-                     formatTimeAmPm(scheduleMinutes[nextIndex]));
+                      formatTimeAmPm(scheduleMinutes[nextIndex]));
 }
 
-bool splitCsvExact(const String &line, String *parts, int expectedCount) {
+bool splitCsvExact(const String &line, String *parts, int expectedCount)
+{
   int start = 0;
-  for (int i = 0; i < expectedCount - 1; i++) {
+  for (int i = 0; i < expectedCount - 1; i++)
+  {
     const int comma = line.indexOf(',', start);
-    if (comma < 0) {
+    if (comma < 0)
+    {
       return false;
     }
     parts[i] = line.substring(start, comma);
     start = comma + 1;
   }
 
-  if (line.indexOf(',', start) != -1) {
+  if (line.indexOf(',', start) != -1)
+  {
     return false;
   }
 
   parts[expectedCount - 1] = line.substring(start);
-  for (int i = 0; i < expectedCount; i++) {
+  for (int i = 0; i < expectedCount; i++)
+  {
     parts[i].trim();
   }
   return true;
 }
 
-bool parseDate(const String &dateValue, int &year, int &month, int &day) {
-  if (dateValue.length() != 10 || dateValue[4] != '-' || dateValue[7] != '-') {
+bool parseDate(const String &dateValue, int &year, int &month, int &day)
+{
+  if (dateValue.length() != 10 || dateValue[4] != '-' || dateValue[7] != '-')
+  {
     return false;
   }
 
   if (!parseDigits(dateValue.substring(0, 4), 4, year) ||
       !parseDigits(dateValue.substring(5, 7), 2, month) ||
-      !parseDigits(dateValue.substring(8, 10), 2, day)) {
+      !parseDigits(dateValue.substring(8, 10), 2, day))
+  {
     return false;
   }
 
-  if (month < 1 || month > 12 || day < 1 || day > 31) {
+  if (month < 1 || month > 12 || day < 1 || day > 31)
+  {
     return false;
   }
 
   return true;
 }
 
-bool parseSlot(const String &token, int &slot) {
-  if (token.length() != 1 || token[0] < '1' || token[0] > '3') {
+bool parseSlot(const String &token, int &slot)
+{
+  if (token.length() != 1 || token[0] < '1' || token[0] > '3')
+  {
     return false;
   }
   slot = token[0] - '0';
   return true;
 }
 
-bool parseClock(const String &clockValue, int &hour, int &minute, int &second) {
-  if (clockValue.length() != 8 || clockValue[2] != ':' || clockValue[5] != ':') {
+bool parseClock(const String &clockValue, int &hour, int &minute, int &second)
+{
+  if (clockValue.length() != 8 || clockValue[2] != ':' || clockValue[5] != ':')
+  {
     return false;
   }
 
   if (!parseDigits(clockValue.substring(0, 2), 2, hour) ||
       !parseDigits(clockValue.substring(3, 5), 2, minute) ||
-      !parseDigits(clockValue.substring(6, 8), 2, second)) {
+      !parseDigits(clockValue.substring(6, 8), 2, second))
+  {
     return false;
   }
 
   if (hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 ||
-      second > 59) {
+      second > 59)
+  {
     return false;
   }
 
   return true;
 }
 
-void saveScheduleToNvs() {
+void saveScheduleToNvs()
+{
   preferences.putInt("med1", scheduleMinutes[0]);
   preferences.putInt("med2", scheduleMinutes[1]);
   preferences.putInt("med3", scheduleMinutes[2]);
+  preferences.putUChar("m1_mode", slotModes[0]);
+  preferences.putUChar("m2_mode", slotModes[1]);
+  preferences.putUChar("m3_mode", slotModes[2]);
+  preferences.putInt("m1_y", oneTimeYear[0]);
+  preferences.putInt("m1_mo", oneTimeMonth[0]);
+  preferences.putInt("m1_d", oneTimeDay[0]);
+  preferences.putInt("m2_y", oneTimeYear[1]);
+  preferences.putInt("m2_mo", oneTimeMonth[1]);
+  preferences.putInt("m2_d", oneTimeDay[1]);
+  preferences.putInt("m3_y", oneTimeYear[2]);
+  preferences.putInt("m3_mo", oneTimeMonth[2]);
+  preferences.putInt("m3_d", oneTimeDay[2]);
+  preferences.putBool("m1_done", oneTimeConsumed[0]);
+  preferences.putBool("m2_done", oneTimeConsumed[1]);
+  preferences.putBool("m3_done", oneTimeConsumed[2]);
 }
 
-void loadScheduleFromNvs() {
+void loadScheduleFromNvs()
+{
   scheduleMinutes[0] = preferences.getInt("med1", kDefaultScheduleMinutes[0]);
   scheduleMinutes[1] = preferences.getInt("med2", kDefaultScheduleMinutes[1]);
   scheduleMinutes[2] = preferences.getInt("med3", kDefaultScheduleMinutes[2]);
+  slotModes[0] = preferences.getUChar("m1_mode", kModeDaily);
+  slotModes[1] = preferences.getUChar("m2_mode", kModeDaily);
+  slotModes[2] = preferences.getUChar("m3_mode", kModeDaily);
+  for (int i = 0; i < 3; i++)
+  {
+    if (slotModes[i] != kModeDaily && slotModes[i] != kModeOneTime)
+    {
+      slotModes[i] = kModeDaily;
+    }
+  }
+  oneTimeYear[0] = preferences.getInt("m1_y", 0);
+  oneTimeMonth[0] = preferences.getInt("m1_mo", 0);
+  oneTimeDay[0] = preferences.getInt("m1_d", 0);
+  oneTimeYear[1] = preferences.getInt("m2_y", 0);
+  oneTimeMonth[1] = preferences.getInt("m2_mo", 0);
+  oneTimeDay[1] = preferences.getInt("m2_d", 0);
+  oneTimeYear[2] = preferences.getInt("m3_y", 0);
+  oneTimeMonth[2] = preferences.getInt("m3_mo", 0);
+  oneTimeDay[2] = preferences.getInt("m3_d", 0);
+  oneTimeConsumed[0] = preferences.getBool("m1_done", false);
+  oneTimeConsumed[1] = preferences.getBool("m2_done", false);
+  oneTimeConsumed[2] = preferences.getBool("m3_done", false);
   scheduleConfigured = preferences.getBool("sched_set", false);
   rtcConfigured = preferences.getBool("rtc_set", false);
 }
 
-void setRtcConfigured(bool configured) {
+void setRtcConfigured(bool configured)
+{
   rtcConfigured = configured;
   preferences.putBool("rtc_set", configured);
 }
 
-void setScheduleConfigured(bool configured) {
+void setScheduleConfigured(bool configured)
+{
   scheduleConfigured = configured;
   preferences.putBool("sched_set", configured);
 }
 
 String bitFlag(bool value) { return value ? "1" : "0"; }
 
-void sendEvent(const String &eventType, uint8_t mask = 0) {
-  if (eventType == "TAKEN" || eventType == "DUE") {
+void sendEvent(const String &eventType, uint8_t mask = 0)
+{
+  if (eventType == "TAKEN" || eventType == "DUE")
+  {
     sendLine(String("EVT,") + eventType + "," + bitFlag((mask & 0x01) != 0) +
              "," + bitFlag((mask & 0x02) != 0) + "," +
              bitFlag((mask & 0x04) != 0));
@@ -386,10 +576,13 @@ void sendEvent(const String &eventType, uint8_t mask = 0) {
   sendLine(String("EVT,") + eventType);
 }
 
-uint8_t dueMask() {
+uint8_t dueMask()
+{
   uint8_t mask = 0;
-  for (int i = 0; i < 3; i++) {
-    if (dueActive[i]) {
+  for (int i = 0; i < 3; i++)
+  {
+    if (dueActive[i])
+    {
       mask |= (1u << i);
     }
   }
@@ -398,29 +591,39 @@ uint8_t dueMask() {
 
 bool hasAnyDueActive() { return dueMask() != 0; }
 
-void setBuzzer(bool enabled) {
-  if (kUsePassiveBuzzer) {
-    if (enabled) {
+void setBuzzer(bool enabled)
+{
+  if (kUsePassiveBuzzer)
+  {
+    if (enabled)
+    {
       tone(kBuzzerPin, kPassiveBuzzerFrequencyHz);
-    } else {
+    }
+    else
+    {
       noTone(kBuzzerPin);
     }
-  } else {
+  }
+  else
+  {
     digitalWrite(kBuzzerPin, enabled ? HIGH : LOW);
   }
   buzzerOn = enabled;
 }
 
-void updateBuzzerState() {
+void updateBuzzerState()
+{
   const bool shouldAlert = hasAnyDueActive() && !refillMode;
-  if (!shouldAlert) {
+  if (!shouldAlert)
+  {
     buzzerAlertRequested = false;
     buzzerPatternOnPhase = false;
     setBuzzer(false);
     return;
   }
 
-  if (!buzzerAlertRequested) {
+  if (!buzzerAlertRequested)
+  {
     buzzerAlertRequested = true;
     buzzerPatternOnPhase = true;
     buzzerPatternTickMs = millis();
@@ -428,15 +631,18 @@ void updateBuzzerState() {
   }
 }
 
-void serviceBuzzerPattern() {
-  if (!buzzerAlertRequested) {
+void serviceBuzzerPattern()
+{
+  if (!buzzerAlertRequested)
+  {
     return;
   }
 
   const uint32_t nowMs = millis();
   const uint32_t phaseDuration =
       buzzerPatternOnPhase ? kBuzzerPatternOnMs : kBuzzerPatternOffMs;
-  if ((nowMs - buzzerPatternTickMs) < phaseDuration) {
+  if ((nowMs - buzzerPatternTickMs) < phaseDuration)
+  {
     return;
   }
 
@@ -445,28 +651,131 @@ void serviceBuzzerPattern() {
   setBuzzer(buzzerPatternOnPhase);
 }
 
-void clearDueState(int index) {
-  if (index < 0 || index > 2) {
+void sendOtaReadyLine()
+{
+  const IPAddress ip = WiFi.softAPIP();
+  const String ipText = ip.toString();
+  sendLine(String("AP_READY,SSID,") + otaApSsid + ",PASS," + otaApPassword +
+           ",IP," + ipText + ",URL,http://" + ipText + "/update,USER," +
+           kOtaWebUser + ",HTTP_PASS," + otaWebPassword + ",TIMEOUT_S," +
+           String(kOtaTimeoutMs / 1000));
+}
+
+void startOtaUpdateMode()
+{
+  initOtaCredentials();
+  if (otaUpdateMode)
+  {
+    sendLine("OK,UPDATE_MODE_ON");
+    sendOtaReadyLine();
+    return;
+  }
+
+  WiFi.mode(WIFI_AP);
+  delay(50);
+  const bool apStarted = WiFi.softAP(otaApSsid.c_str(), otaApPassword.c_str());
+  if (!apStarted)
+  {
+    WiFi.mode(WIFI_OFF);
+    sendError("AP_START_FAIL");
+    debugLog("OTA_AP_START_FAIL");
+    return;
+  }
+
+  if (!otaServerStarted)
+  {
+    otaUpdater.setup(&otaServer, "/update", kOtaWebUser, otaWebPassword.c_str());
+    otaServer.on("/", []()
+                 { otaServer.send(200, "text/plain",
+                                  "SMR OTA ready. Open /update to upload firmware.\n"); });
+    otaServer.onNotFound([]()
+                         { otaServer.send(404, "text/plain", "Not found. Use /update.\n"); });
+    otaServerStarted = true;
+  }
+  otaServer.begin();
+
+  otaUpdateMode = true;
+  otaModeStartedMs = millis();
+  buzzerAlertRequested = false;
+  buzzerPatternOnPhase = false;
+  setBuzzer(false);
+  debugLog(String("OTA_MODE_ON,SSID=") + otaApSsid + ",IP=" +
+           WiFi.softAPIP().toString());
+  sendLine("OK,UPDATE_MODE_ON");
+  sendOtaReadyLine();
+}
+
+void stopOtaUpdateMode(bool timedOut)
+{
+  if (!otaUpdateMode)
+  {
+    if (!timedOut)
+    {
+      sendLine("OK,UPDATE_MODE_OFF");
+    }
+    return;
+  }
+
+  otaUpdateMode = false;
+  if (otaServerStarted)
+  {
+    otaServer.stop();
+  }
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_OFF);
+  updateBuzzerState();
+  debugLog("OTA_MODE_OFF");
+  if (timedOut)
+  {
+    sendLine("EVT,UPDATE_TIMEOUT");
+  }
+  sendLine("OK,UPDATE_MODE_OFF");
+}
+
+void serviceOtaUpdateMode()
+{
+  if (!otaUpdateMode)
+  {
+    return;
+  }
+
+  otaServer.handleClient();
+  if ((millis() - otaModeStartedMs) >= kOtaTimeoutMs)
+  {
+    stopOtaUpdateMode(true);
+  }
+}
+
+void clearDueState(int index)
+{
+  if (index < 0 || index > 2)
+  {
     return;
   }
   dueActive[index] = false;
 }
 
-void clearAllDueState() {
-  for (int i = 0; i < 3; i++) {
+void clearAllDueState()
+{
+  for (int i = 0; i < 3; i++)
+  {
     dueActive[i] = false;
   }
 }
 
-void lockAllCompartments() {
-  for (int i = 0; i < 3; i++) {
+void lockAllCompartments()
+{
+  for (int i = 0; i < 3; i++)
+  {
     servos[i].write(lockAngles[i]);
     compartmentOpen[i] = false;
   }
 }
 
-void openCompartment(int index) {
-  if (index < 0 || index > 2) {
+void openCompartment(int index)
+{
+  if (index < 0 || index > 2)
+  {
     return;
   }
 
@@ -474,8 +783,10 @@ void openCompartment(int index) {
   compartmentOpen[index] = true;
 }
 
-void closeCompartment(int index) {
-  if (index < 0 || index > 2) {
+void closeCompartment(int index)
+{
+  if (index < 0 || index > 2)
+  {
     return;
   }
 
@@ -483,19 +794,24 @@ void closeCompartment(int index) {
   compartmentOpen[index] = false;
 }
 
-void openAllCompartments() {
-  for (int i = 0; i < 3; i++) {
+void openAllCompartments()
+{
+  for (int i = 0; i < 3; i++)
+  {
     openCompartment(i);
   }
 }
 
-void closeAllCompartments() {
-  for (int i = 0; i < 3; i++) {
+void closeAllCompartments()
+{
+  for (int i = 0; i < 3; i++)
+  {
     closeCompartment(i);
   }
 }
 
-void acknowledgeDueFromButton() {
+void acknowledgeDueFromButton()
+{
   // Button A: acknowledge currently due medicines only, but close all slots.
   const uint8_t mask = dueMask();
   closeAllCompartments();
@@ -504,8 +820,10 @@ void acknowledgeDueFromButton() {
   sendEvent("TAKEN", mask);
 }
 
-void toggleRefillMode() {
-  if (!refillMode) {
+void toggleRefillMode()
+{
+  if (!refillMode)
+  {
     refillMode = true;
     clearAllDueState();
     setBuzzer(false);
@@ -523,7 +841,8 @@ void toggleRefillMode() {
   debugLog("REFILL_MODE,OFF");
 }
 
-void initButtonState(ButtonState &state) {
+void initButtonState(ButtonState &state)
+{
   pinMode(state.pin, INPUT_PULLUP);
   const bool pressed = (digitalRead(state.pin) == LOW);
   state.rawPressed = pressed;
@@ -533,30 +852,39 @@ void initButtonState(ButtonState &state) {
   state.longPressHandled = false;
 }
 
-void serviceButtons() {
+void serviceButtons()
+{
   const uint32_t nowMs = millis();
   ButtonState *buttons[2] = {&ackButton, &refillButton};
-  for (int i = 0; i < 2; i++) {
+  for (int i = 0; i < 2; i++)
+  {
     ButtonState &button = *buttons[i];
     const bool rawPressed = (digitalRead(button.pin) == LOW);
-    if (rawPressed != button.rawPressed) {
+    if (rawPressed != button.rawPressed)
+    {
       button.rawPressed = rawPressed;
       button.lastRawChangeMs = nowMs;
     }
 
-    if ((nowMs - button.lastRawChangeMs) < kButtonDebounceMs) {
+    if ((nowMs - button.lastRawChangeMs) < kButtonDebounceMs)
+    {
       continue;
     }
 
-    if (button.stablePressed != button.rawPressed) {
+    if (button.stablePressed != button.rawPressed)
+    {
       button.stablePressed = button.rawPressed;
-      if (button.stablePressed) {
+      if (button.stablePressed)
+      {
         button.pressedSinceMs = nowMs;
         button.longPressHandled = false;
-        if (button.pin == kAckButtonPin && !refillMode) {
+        if (button.pin == kAckButtonPin && !refillMode)
+        {
           acknowledgeDueFromButton();
         }
-      } else {
+      }
+      else
+      {
         button.pressedSinceMs = 0;
         button.longPressHandled = false;
       }
@@ -564,23 +892,88 @@ void serviceButtons() {
   }
 
   if (refillButton.stablePressed && !refillButton.longPressHandled &&
-      (nowMs - refillButton.pressedSinceMs) >= kRefillLongPressMs) {
+      (nowMs - refillButton.pressedSinceMs) >= kRefillLongPressMs)
+  {
     refillButton.longPressHandled = true;
     toggleRefillMode();
   }
 }
 
-void sendCurrentSchedule() {
-  sendLine(String("SCHED,1,") + formatHHMM(scheduleMinutes[0]) + ",2," +
-           formatHHMM(scheduleMinutes[1]) + ",3," +
-           formatHHMM(scheduleMinutes[2]));
+String slotDescriptor(int index)
+{
+  if (slotModes[index] == kModeOneTime && hasValidOneTimeDate(index))
+  {
+    return String("O@") +
+           formatDateYMD(oneTimeYear[index], oneTimeMonth[index],
+                         oneTimeDay[index]) +
+           "@" + formatHHMM(scheduleMinutes[index]);
+  }
+  return String("D@") + formatHHMM(scheduleMinutes[index]);
+}
+
+void sendCurrentSchedule()
+{
+  sendLine(String("SCHED2,1,") + slotDescriptor(0) + ",2," + slotDescriptor(1) +
+           ",3," + slotDescriptor(2));
 }
 
 void handleGetCommand() { sendCurrentSchedule(); }
 
-void handleSyncCommand(const String &line) {
+bool parseSyncDescriptor(const String &descriptor, uint8_t &modeOut,
+                         int &minutesOut, int &yearOut, int &monthOut,
+                         int &dayOut)
+{
+  if (descriptor.startsWith("D@"))
+  {
+    int parsedMinutes = 0;
+    if (!parseHHMM(descriptor.substring(2), parsedMinutes))
+    {
+      return false;
+    }
+    modeOut = kModeDaily;
+    minutesOut = parsedMinutes;
+    yearOut = 0;
+    monthOut = 0;
+    dayOut = 0;
+    return true;
+  }
+
+  if (descriptor.startsWith("O@"))
+  {
+    const int separator = descriptor.indexOf('@', 2);
+    if (separator <= 2 || separator >= static_cast<int>(descriptor.length() - 1))
+    {
+      return false;
+    }
+
+    const String datePart = descriptor.substring(2, separator);
+    const String timePart = descriptor.substring(separator + 1);
+    int parsedYear = 0;
+    int parsedMonth = 0;
+    int parsedDay = 0;
+    int parsedMinutes = 0;
+    if (!parseDate(datePart, parsedYear, parsedMonth, parsedDay) ||
+        !parseHHMM(timePart, parsedMinutes))
+    {
+      return false;
+    }
+
+    modeOut = kModeOneTime;
+    minutesOut = parsedMinutes;
+    yearOut = parsedYear;
+    monthOut = parsedMonth;
+    dayOut = parsedDay;
+    return true;
+  }
+
+  return false;
+}
+
+void handleSyncCommand(const String &line)
+{
   String parts[4];
-  if (!splitCsvExact(line, parts, 4) || parts[0] != "SYNC") {
+  if (!splitCsvExact(line, parts, 4) || parts[0] != "SYNC")
+  {
     sendError("BAD_FORMAT");
     return;
   }
@@ -588,52 +981,110 @@ void handleSyncCommand(const String &line) {
   int parsedMinutes[3];
   if (!parseHHMM(parts[1], parsedMinutes[0]) ||
       !parseHHMM(parts[2], parsedMinutes[1]) ||
-      !parseHHMM(parts[3], parsedMinutes[2])) {
+      !parseHHMM(parts[3], parsedMinutes[2]))
+  {
     sendError("BAD_FORMAT");
     return;
   }
 
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < 3; i++)
+  {
     scheduleMinutes[i] = parsedMinutes[i];
+    slotModes[i] = kModeDaily;
+    oneTimeYear[i] = 0;
+    oneTimeMonth[i] = 0;
+    oneTimeDay[i] = 0;
+    oneTimeConsumed[i] = false;
   }
+  resetDailyTriggerFlags();
   saveScheduleToNvs();
   setScheduleConfigured(true);
   sendLine("OK,SYNC");
 }
 
-void handleSetCommand(const String &line) {
+void handleSync2Command(const String &line)
+{
+  String parts[4];
+  if (!splitCsvExact(line, parts, 4) || parts[0] != "SYNC2")
+  {
+    sendError("BAD_FORMAT");
+    return;
+  }
+
+  for (int i = 0; i < 3; i++)
+  {
+    uint8_t parsedMode = kModeDaily;
+    int parsedMinutes = 0;
+    int parsedYear = 0;
+    int parsedMonth = 0;
+    int parsedDay = 0;
+    if (!parseSyncDescriptor(parts[i + 1], parsedMode, parsedMinutes, parsedYear,
+                             parsedMonth, parsedDay))
+    {
+      sendError("BAD_FORMAT");
+      return;
+    }
+
+    slotModes[i] = parsedMode;
+    scheduleMinutes[i] = parsedMinutes;
+    oneTimeYear[i] = parsedYear;
+    oneTimeMonth[i] = parsedMonth;
+    oneTimeDay[i] = parsedDay;
+    oneTimeConsumed[i] = false;
+  }
+
+  resetDailyTriggerFlags();
+  saveScheduleToNvs();
+  setScheduleConfigured(true);
+  sendLine("OK,SYNC2");
+}
+
+void handleSetCommand(const String &line)
+{
   String parts[3];
-  if (!splitCsvExact(line, parts, 3) || parts[0] != "SET") {
+  if (!splitCsvExact(line, parts, 3) || parts[0] != "SET")
+  {
     sendError("BAD_FORMAT");
     return;
   }
 
   int slot = 0;
-  if (!parseSlot(parts[1], slot)) {
+  if (!parseSlot(parts[1], slot))
+  {
     sendError("BAD_FORMAT");
     return;
   }
 
   int parsedMinutes = 0;
-  if (!parseHHMM(parts[2], parsedMinutes)) {
+  if (!parseHHMM(parts[2], parsedMinutes))
+  {
     sendError("BAD_FORMAT");
     return;
   }
 
   scheduleMinutes[slot - 1] = parsedMinutes;
+  slotModes[slot - 1] = kModeDaily;
+  oneTimeYear[slot - 1] = 0;
+  oneTimeMonth[slot - 1] = 0;
+  oneTimeDay[slot - 1] = 0;
+  oneTimeConsumed[slot - 1] = false;
+  resetDailyTriggerFlags();
   saveScheduleToNvs();
   setScheduleConfigured(true);
   sendLine("OK,SET");
 }
 
-void handleTimeCommand(const String &line) {
-  if (!rtcAvailable) {
+void handleTimeCommand(const String &line)
+{
+  if (!rtcAvailable)
+  {
     sendError("RTC_NOT_SET");
     return;
   }
 
   String parts[3];
-  if (!splitCsvExact(line, parts, 3) || parts[0] != "TIME") {
+  if (!splitCsvExact(line, parts, 3) || parts[0] != "TIME")
+  {
     sendError("BAD_FORMAT");
     return;
   }
@@ -645,25 +1096,30 @@ void handleTimeCommand(const String &line) {
   int minute = 0;
   int second = 0;
   if (!parseDate(parts[1], year, month, day) ||
-      !parseClock(parts[2], hour, minute, second)) {
+      !parseClock(parts[2], hour, minute, second))
+  {
     sendError("BAD_FORMAT");
     return;
   }
 
   rtc.adjust(DateTime(year, month, day, hour, minute, second));
   setRtcConfigured(true);
+  lastSecondOfDay = -1;
   sendLine("OK,TIME");
 }
 
-void handleTestCommand(const String &line) {
+void handleTestCommand(const String &line)
+{
   String parts[2];
-  if (!splitCsvExact(line, parts, 2) || parts[0] != "TEST") {
+  if (!splitCsvExact(line, parts, 2) || parts[0] != "TEST")
+  {
     sendError("BAD_FORMAT");
     return;
   }
 
   int slot = 0;
-  if (!parseSlot(parts[1], slot)) {
+  if (!parseSlot(parts[1], slot))
+  {
     sendError("BAD_FORMAT");
     return;
   }
@@ -672,77 +1128,163 @@ void handleTestCommand(const String &line) {
   sendLine("OK,TEST");
 }
 
-void handleAcknowledgeCommand(const String &line) {
+void handleAcknowledgeCommand(const String &line)
+{
   String parts[2];
-  if (!splitCsvExact(line, parts, 2) || parts[0] != "ACK") {
+  if (!splitCsvExact(line, parts, 2) || parts[0] != "ACK")
+  {
     sendError("BAD_FORMAT");
     return;
   }
 
   int slot = 0;
-  if (!parseSlot(parts[1], slot)) {
+  if (!parseSlot(parts[1], slot))
+  {
     sendError("BAD_FORMAT");
+    return;
+  }
+
+  if (!dueActive[slot - 1])
+  {
+    sendError("NOT_DUE");
     return;
   }
 
   closeCompartment(slot - 1);
   clearDueState(slot - 1);
   updateBuzzerState();
+  sendEvent("TAKEN", static_cast<uint8_t>(1u << (slot - 1)));
   sendLine("OK,ACK");
 }
 
-void processCommand(const String &rawLine) {
+void handleEnterUpdateModeCommand(const String &line)
+{
+  if (line != "ENTER_UPDATE_MODE")
+  {
+    sendError("BAD_FORMAT");
+    return;
+  }
+  startOtaUpdateMode();
+}
+
+void handleExitUpdateModeCommand(const String &line)
+{
+  if (line != "EXIT_UPDATE_MODE")
+  {
+    sendError("BAD_FORMAT");
+    return;
+  }
+  stopOtaUpdateMode(false);
+}
+
+void handleOtaStatusCommand(const String &line)
+{
+  if (line != "OTA_STATUS")
+  {
+    sendError("BAD_FORMAT");
+    return;
+  }
+
+  if (!otaUpdateMode)
+  {
+    sendLine("OTA_STATUS,OFF");
+    return;
+  }
+
+  const IPAddress ip = WiFi.softAPIP();
+  const uint32_t elapsedMs = millis() - otaModeStartedMs;
+  const uint32_t remainingSec =
+      elapsedMs >= kOtaTimeoutMs ? 0 : (kOtaTimeoutMs - elapsedMs) / 1000;
+  sendLine(String("OTA_STATUS,ON,IP,") + ip.toString() + ",SSID," + otaApSsid +
+           ",TIMEOUT_S," + String(remainingSec));
+}
+
+void processCommand(const String &rawLine)
+{
   String line = rawLine;
   line.trim();
-  if (line.isEmpty()) {
+  if (line.isEmpty())
+  {
     return;
   }
   debugLog(String("BT_RX,") + line);
 
-  if (line == "GET") {
+  if (line == "GET")
+  {
     handleGetCommand();
     return;
   }
-  if (line.startsWith("SYNC,")) {
+  if (line.startsWith("SYNC,"))
+  {
     handleSyncCommand(line);
     return;
   }
-  if (line.startsWith("SET,")) {
+  if (line.startsWith("SYNC2,"))
+  {
+    handleSync2Command(line);
+    return;
+  }
+  if (line.startsWith("SET,"))
+  {
     handleSetCommand(line);
     return;
   }
-  if (line.startsWith("TIME,")) {
+  if (line.startsWith("TIME,"))
+  {
     handleTimeCommand(line);
     return;
   }
-  if (line.startsWith("TEST,")) {
+  if (line.startsWith("TEST,"))
+  {
     handleTestCommand(line);
     return;
   }
-  if (line.startsWith("ACK,")) {
+  if (line.startsWith("ACK,"))
+  {
     handleAcknowledgeCommand(line);
+    return;
+  }
+  if (line == "ENTER_UPDATE_MODE")
+  {
+    handleEnterUpdateModeCommand(line);
+    return;
+  }
+  if (line == "EXIT_UPDATE_MODE")
+  {
+    handleExitUpdateModeCommand(line);
+    return;
+  }
+  if (line == "OTA_STATUS")
+  {
+    handleOtaStatusCommand(line);
     return;
   }
 
   sendError("BAD_FORMAT");
 }
 
-void readBluetoothInput() {
-  while (serialBt.available()) {
+void readBluetoothInput()
+{
+  while (serialBt.available())
+  {
     const char incoming = static_cast<char>(serialBt.read());
-    if (incoming == '\r') {
+    if (incoming == '\r')
+    {
       continue;
     }
 
-    if (incoming == '\n') {
-      if (inputBuffer.length() > 0) {
+    if (incoming == '\n')
+    {
+      if (inputBuffer.length() > 0)
+      {
         processCommand(inputBuffer);
         inputBuffer = "";
       }
       continue;
     }
 
-    if (inputBuffer.length() >= kMaxInboundLineLength) {
+    if (inputBuffer.length() >= kMaxInboundLineLength)
+    {
       inputBuffer = "";
       sendError("BAD_FORMAT");
       continue;
@@ -751,55 +1293,170 @@ void readBluetoothInput() {
   }
 }
 
-void resetDailyTriggerFlags() {
-  for (int i = 0; i < 3; i++) {
+void resetDailyTriggerFlags()
+{
+  for (int i = 0; i < 3; i++)
+  {
     triggeredToday[i] = false;
   }
+  lastSecondOfDay = -1;
   clearAllDueState();
   updateBuzzerState();
 }
 
-int dateKeyFor(const DateTime &dateTime) {
+int dateKeyFor(const DateTime &dateTime)
+{
   return (dateTime.year() * 10000) + (dateTime.month() * 100) + dateTime.day();
 }
 
-void schedulerTick() {
-  if (!rtcAvailable || !rtcConfigured) {
+int secondOfDayFor(const DateTime &dateTime)
+{
+  return (dateTime.hour() * 3600) + (dateTime.minute() * 60) + dateTime.second();
+}
+
+bool shouldTriggerSlotNow(int scheduleSecondOfDay, int nowSecondOfDay,
+                          int previousSecondOfDay)
+{
+  if (previousSecondOfDay < 0)
+  {
+    if (nowSecondOfDay < scheduleSecondOfDay)
+    {
+      return false;
+    }
+    return (nowSecondOfDay - scheduleSecondOfDay) <= kStartupCatchupWindowSec;
+  }
+
+  if (nowSecondOfDay >= previousSecondOfDay)
+  {
+    return (scheduleSecondOfDay > previousSecondOfDay) &&
+           (scheduleSecondOfDay <= nowSecondOfDay);
+  }
+
+  // Midnight wrap (or major time rollback): trigger if slot second is in either
+  // wrapped segment [previous..23:59:59] U [00:00:00..now].
+  return (scheduleSecondOfDay > previousSecondOfDay) ||
+         (scheduleSecondOfDay <= nowSecondOfDay);
+}
+
+int dateKeyFromYMD(int year, int month, int day)
+{
+  return (year * 10000) + (month * 100) + day;
+}
+
+void schedulerTick()
+{
+  if (otaUpdateMode)
+  {
+    return;
+  }
+
+  if (!rtcAvailable || !rtcConfigured || !scheduleConfigured)
+  {
     return;
   }
 
   const DateTime now = rtc.now();
   const int todayKey = dateKeyFor(now);
-  if (todayKey != lastDateKey) {
+  const int nowSecondOfDay = secondOfDayFor(now);
+  if (todayKey != lastDateKey)
+  {
     lastDateKey = todayKey;
     resetDailyTriggerFlags();
   }
 
-  if (refillMode) {
+  // If time is synced backward while staying in the same date, do not treat it
+  // as a wrap trigger window.
+  if (lastSecondOfDay >= 0 && todayKey == lastDateKey &&
+      nowSecondOfDay + 2 < lastSecondOfDay)
+  {
+    debugLog(String("SCHED_TIME_ROLLBACK,prev=") + lastSecondOfDay + ",now=" +
+             nowSecondOfDay);
+    lastSecondOfDay = nowSecondOfDay;
     return;
   }
 
-  const int minutesNow = (now.hour() * 60) + now.minute();
+  if (refillMode)
+  {
+    lastSecondOfDay = nowSecondOfDay;
+    return;
+  }
+
   uint8_t newlyDueMask = 0;
-  for (int i = 0; i < 3; i++) {
-    if (triggeredToday[i]) {
+  bool scheduleStateChanged = false;
+  for (int i = 0; i < 3; i++)
+  {
+    const int scheduleSecondOfDay = scheduleMinutes[i] * 60;
+
+    if (slotModes[i] == kModeOneTime)
+    {
+      if (oneTimeConsumed[i] || !hasValidOneTimeDate(i))
+      {
+        continue;
+      }
+
+      const int slotDateKey =
+          dateKeyFromYMD(oneTimeYear[i], oneTimeMonth[i], oneTimeDay[i]);
+      if (todayKey < slotDateKey)
+      {
+        continue;
+      }
+      if (todayKey > slotDateKey)
+      {
+        oneTimeConsumed[i] = true;
+        scheduleStateChanged = true;
+        continue;
+      }
+
+      if (!shouldTriggerSlotNow(scheduleSecondOfDay, nowSecondOfDay,
+                                lastSecondOfDay))
+      {
+        continue;
+      }
+
+      oneTimeConsumed[i] = true;
+      dueActive[i] = true;
+      openCompartment(i);
+      newlyDueMask |= (1u << i);
+      scheduleStateChanged = true;
+      debugLog(String("SCHED_TRIGGER_ONCE,slot=") + (i + 1) + ",date=" +
+               formatDateYMD(oneTimeYear[i], oneTimeMonth[i], oneTimeDay[i]) +
+               ",time=" + formatHHMM(scheduleMinutes[i]) + ",now=" +
+               formatHHMMSS(now));
       continue;
     }
-    if (scheduleMinutes[i] == minutesNow) {
+
+    if (triggeredToday[i])
+    {
+      continue;
+    }
+
+    if (shouldTriggerSlotNow(scheduleSecondOfDay, nowSecondOfDay,
+                             lastSecondOfDay))
+    {
       triggeredToday[i] = true;
       dueActive[i] = true;
       openCompartment(i);
       newlyDueMask |= (1u << i);
+      debugLog(String("SCHED_TRIGGER_DAILY,slot=") + (i + 1) + ",time=" +
+               formatHHMM(scheduleMinutes[i]) + ",now=" + formatHHMMSS(now));
     }
   }
 
-  if (newlyDueMask != 0) {
+  lastSecondOfDay = nowSecondOfDay;
+  if (scheduleStateChanged)
+  {
+    saveScheduleToNvs();
+  }
+
+  if (newlyDueMask != 0)
+  {
     updateBuzzerState();
     sendEvent("DUE", newlyDueMask);
   }
 }
 
-void setup() {
+void setup()
+{
   Serial.begin(115200);
   delay(200);
 
@@ -813,19 +1470,24 @@ void setup() {
 
   preferences.begin("smr", false);
   loadScheduleFromNvs();
+  initOtaCredentials();
+  WiFi.mode(WIFI_OFF);
 
   rtcAvailable = rtc.begin();
-  if (rtcAvailable && rtc.lostPower()) {
+  if (rtcAvailable && rtc.lostPower())
+  {
     setRtcConfigured(false);
   }
 
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < 3; i++)
+  {
     servos[i].setPeriodHertz(50);
     servos[i].attach(kServoPins[i], 500, 2400);
   }
   lockAllCompartments();
   pinMode(kBuzzerPin, OUTPUT);
-  if (kUsePassiveBuzzer) {
+  if (kUsePassiveBuzzer)
+  {
     noTone(kBuzzerPin);
   }
   setBuzzer(false);
@@ -834,35 +1496,41 @@ void setup() {
 
   serialBt.begin(kDeviceName);
   updateDisplay();
-  debugLog("Smart Medicine Reminder started");
+  debugLog("Smart Medicine Dispenser Started");
 }
 
-void loop() {
+void loop()
+{
   serviceButtons();
+  const uint32_t nowMs = millis();
+  if ((nowMs - lastSchedulerTickMs) >= kSchedulerIntervalMs)
+  {
+    lastSchedulerTickMs = nowMs;
+    schedulerTick();
+  }
+
   serviceBuzzerPattern();
   readBluetoothInput();
+  serviceOtaUpdateMode();
 
   const bool btClientState = serialBt.hasClient();
-  if (btClientState != lastBtClientState) {
+  if (btClientState != lastBtClientState)
+  {
     lastBtClientState = btClientState;
     debugLog(String("BT_CLIENT,") + (btClientState ? "1" : "0"));
   }
 
-  const uint32_t nowMs = millis();
-  if ((nowMs - lastDisplayTickMs) >= kDisplayRefreshMs) {
+  if ((nowMs - lastDisplayTickMs) >= kDisplayRefreshMs)
+  {
     lastDisplayTickMs = nowMs;
     updateDisplay();
   }
 
-  if ((nowMs - lastLcdRecoverMs) >= kLcdRecoverIntervalMs) {
+  if ((nowMs - lastLcdRecoverMs) >= kLcdRecoverIntervalMs)
+  {
     lastLcdRecoverMs = nowMs;
     initLcd();
     updateDisplay();
     debugLog("LCD_RECOVER");
-  }
-
-  if ((nowMs - lastSchedulerTickMs) >= 200) {
-    lastSchedulerTickMs = nowMs;
-    schedulerTick();
   }
 }

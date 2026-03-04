@@ -99,19 +99,26 @@ class NotificationService {
     );
   }
 
-  Future<void> scheduleDailyReminders(
+  Future<void> scheduleReminders(
     MedicineSchedule schedule, {
     required bool useExactAlarms,
   }) async {
     for (var medicineNumber = 1; medicineNumber <= 3; medicineNumber++) {
-      final time = schedule.timeForMedicine(medicineNumber);
-      await scheduleReminderForMedicine(
+      final plan = schedule.planForMedicine(medicineNumber);
+      await scheduleReminderForPlan(
         medicineNumber,
-        time,
+        plan,
         useExactAlarms: useExactAlarms,
         delaySeconds: 0,
       );
     }
+  }
+
+  Future<void> scheduleDailyReminders(
+    MedicineSchedule schedule, {
+    required bool useExactAlarms,
+  }) {
+    return scheduleReminders(schedule, useExactAlarms: useExactAlarms);
   }
 
   Future<void> cancelReminderForMedicine(int medicineNumber) async {
@@ -124,22 +131,68 @@ class NotificationService {
     required bool useExactAlarms,
     int delaySeconds = 0,
   }) async {
+    await scheduleReminderForPlan(
+      medicineNumber,
+      MedicinePlan.daily(time),
+      useExactAlarms: useExactAlarms,
+      delaySeconds: delaySeconds,
+    );
+  }
+
+  Future<void> scheduleReminderForPlan(
+    int medicineNumber,
+    MedicinePlan plan, {
+    required bool useExactAlarms,
+    int delaySeconds = 0,
+  }) async {
     final normalizedDelay = delaySeconds.clamp(0, 59);
     final scheduleMode = useExactAlarms
         ? AndroidScheduleMode.exactAllowWhileIdle
         : AndroidScheduleMode.inexactAllowWhileIdle;
-    final scheduledDate = _nextInstanceOf(time, secondOffset: normalizedDelay);
 
     await _plugin.cancel(id: _notificationId(medicineNumber));
+
+    if (plan.isDaily) {
+      final scheduledDate = _nextInstanceOf(
+        plan.time,
+        secondOffset: normalizedDelay,
+      );
+      await _plugin.zonedSchedule(
+        id: _notificationId(medicineNumber),
+        title: "Medicine $medicineNumber time",
+        body: "Compartment $medicineNumber at ${plan.time.to12HourString()}",
+        scheduledDate: scheduledDate,
+        notificationDetails: _defaultNotificationDetails,
+        payload: "medicine_$medicineNumber",
+        androidScheduleMode: scheduleMode,
+        matchDateTimeComponents: DateTimeComponents.time,
+      );
+      return;
+    }
+
+    final oneTimeDateTime = plan.oneTimeDateTime();
+    if (oneTimeDateTime == null) {
+      return;
+    }
+
+    var scheduledDate = _toTzDateTime(oneTimeDateTime);
+    if (normalizedDelay > 0) {
+      scheduledDate = scheduledDate.add(Duration(seconds: normalizedDelay));
+    }
+    if (!scheduledDate.isAfter(tz.TZDateTime.now(tz.local))) {
+      // One-time reminder in the past should not be scheduled.
+      return;
+    }
+
     await _plugin.zonedSchedule(
       id: _notificationId(medicineNumber),
       title: "Medicine $medicineNumber time",
-      body: "Compartment $medicineNumber at ${time.to24HourString()}",
+      body: "Compartment $medicineNumber at ${plan.time.to12HourString()}",
       scheduledDate: scheduledDate,
       notificationDetails: _defaultNotificationDetails,
       payload: "medicine_$medicineNumber",
       androidScheduleMode: scheduleMode,
-      matchDateTimeComponents: DateTimeComponents.time,
+      matchDateTimeComponents: null,
     );
   }
 
@@ -170,6 +223,18 @@ class NotificationService {
       scheduled = scheduled.add(const Duration(days: 1));
     }
     return scheduled;
+  }
+
+  tz.TZDateTime _toTzDateTime(DateTime dateTime) {
+    return tz.TZDateTime(
+      tz.local,
+      dateTime.year,
+      dateTime.month,
+      dateTime.day,
+      dateTime.hour,
+      dateTime.minute,
+      dateTime.second,
+    );
   }
 
   Future<void> _configureTimezone() async {

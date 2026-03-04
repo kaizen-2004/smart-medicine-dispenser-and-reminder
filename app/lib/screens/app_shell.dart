@@ -97,14 +97,14 @@ class _AppShellState extends State<AppShell> {
           ),
           NavigationDestination(
             icon: Icon(Icons.bluetooth_searching),
-            selectedIcon: Icon(Icons.bluetooth_connected),
-            label: "Connect",
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.bar_chart_outlined),
-            selectedIcon: Icon(Icons.bar_chart),
-            label: "Records",
-          ),
+              selectedIcon: Icon(Icons.bluetooth_connected),
+              label: "Connect",
+            ),
+            NavigationDestination(
+              icon: Icon(Icons.bar_chart_outlined),
+              selectedIcon: Icon(Icons.bar_chart),
+              label: "Records",
+            ),
           NavigationDestination(
             icon: Icon(Icons.info_outline),
             selectedIcon: Icon(Icons.info),

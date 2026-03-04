@@ -5,6 +5,24 @@ import 'dart:typed_data';
 import 'package:bluetooth_classic/bluetooth_classic.dart';
 import 'package:bluetooth_classic/models/device.dart';
 
+typedef LineMatcher = bool Function(String line);
+
+class _PendingCommandResponse {
+  final Completer<String?> completer;
+  final LineMatcher matcher;
+
+  _PendingCommandResponse({required this.completer, required this.matcher});
+
+  void maybeComplete(String line) {
+    if (completer.isCompleted) {
+      return;
+    }
+    if (matcher(line)) {
+      completer.complete(line);
+    }
+  }
+}
+
 class BluetoothService {
   static const String deviceName = "Smart-Medicine-Reminder";
   static const String serialPortUuid = "00001101-0000-1000-8000-00805f9b34fb";
@@ -21,6 +39,8 @@ class BluetoothService {
   String _buffer = "";
   int _lastStatus = Device.disconnected;
   String? _lastAddress;
+  Future<void> _commandQueue = Future<void>.value();
+  _PendingCommandResponse? _pendingResponse;
 
   Stream<String> get onLineReceived => _lineController.stream;
   Stream<int> get onDeviceStatusChanged => _statusController.stream;
@@ -69,10 +89,16 @@ class BluetoothService {
   }
 
   Future<bool> connect(String address) async {
+    final targetAddress = address.trim();
+    if (targetAddress.isEmpty) {
+      return false;
+    }
     try {
       _bindListeners();
-      _lastAddress = address;
-      return await _classic.connect(address, serialPortUuid);
+      _lastAddress = targetAddress;
+      return await _classic
+          .connect(targetAddress, serialPortUuid)
+          .timeout(const Duration(seconds: 15), onTimeout: () => false);
     } catch (_) {
       return false;
     }
@@ -99,60 +125,78 @@ class BluetoothService {
     String command, {
     Duration timeout = const Duration(seconds: 8),
     bool retryOnNoResponse = true,
+    LineMatcher? acceptResponse,
   }) async {
-    final response = await _sendAndAwait(command, timeout: timeout);
-    if (response != null || !retryOnNoResponse) {
-      return response;
-    }
+    return _enqueueCommand(() async {
+      final matcher = acceptResponse ?? _defaultResponseMatcher;
+      final response = await _sendAndAwait(
+        command,
+        timeout: timeout,
+        matcher: matcher,
+      );
+      if (response != null || !retryOnNoResponse) {
+        return response;
+      }
 
-    // Retry once without reconnect if link still appears active.
-    if (isConnected) {
-      return _sendAndAwait(command, timeout: timeout);
-    }
+      // Retry once without reconnect if link still appears active.
+      if (isConnected) {
+        return _sendAndAwait(command, timeout: timeout, matcher: matcher);
+      }
 
-    // Retry once on transient disconnect by reconnecting to last address.
-    if (_lastAddress == null) {
-      return null;
-    }
-    final reconnected = await connect(_lastAddress!);
-    if (!reconnected) {
-      return null;
-    }
-    return _sendAndAwait(command, timeout: timeout);
+      // Retry once on transient disconnect by reconnecting to last address.
+      if (_lastAddress == null) {
+        return null;
+      }
+      final reconnected = await connect(_lastAddress!);
+      if (!reconnected) {
+        return null;
+      }
+      return _sendAndAwait(command, timeout: timeout, matcher: matcher);
+    });
+  }
+
+  bool _defaultResponseMatcher(String line) {
+    return !line.startsWith("EVT,");
+  }
+
+  Future<T> _enqueueCommand<T>(Future<T> Function() action) {
+    final completer = Completer<T>();
+    _commandQueue = _commandQueue.then((_) async {
+      try {
+        final result = await action();
+        if (!completer.isCompleted) {
+          completer.complete(result);
+        }
+      } catch (error, stackTrace) {
+        if (!completer.isCompleted) {
+          completer.completeError(error, stackTrace);
+        }
+      }
+    });
+    return completer.future;
   }
 
   Future<String?> _sendAndAwait(
     String command, {
     required Duration timeout,
+    required LineMatcher matcher,
   }) async {
-    final completer = Completer<String?>();
-    late final StreamSubscription<String> sub;
-    sub = onLineReceived.listen(
-      (line) {
-        if (line.startsWith("EVT,")) {
-          // Keep waiting for command response while events are handled by
-          // background listeners.
-          return;
-        }
-        if (!completer.isCompleted) {
-          completer.complete(line);
-        }
-      },
-      onError: (_) {
-        if (!completer.isCompleted) {
-          completer.complete(null);
-        }
-      },
+    final pending = _PendingCommandResponse(
+      completer: Completer<String?>(),
+      matcher: matcher,
     );
+    _pendingResponse = pending;
 
     try {
       final sent = await sendLine(command);
       if (!sent) {
         return null;
       }
-      return completer.future.timeout(timeout, onTimeout: () => null);
+      return pending.completer.future.timeout(timeout, onTimeout: () => null);
     } finally {
-      await sub.cancel();
+      if (identical(_pendingResponse, pending)) {
+        _pendingResponse = null;
+      }
     }
   }
 
@@ -164,8 +208,22 @@ class BluetoothService {
 
     _statusSubscription ??= _classic.onDeviceStatusChanged().listen((status) {
       _lastStatus = status;
+      if (status != Device.connected) {
+        _failPendingCommand();
+      }
       _statusController.add(status);
     }, onError: (_) {});
+  }
+
+  void _failPendingCommand() {
+    final pending = _pendingResponse;
+    if (pending == null) {
+      return;
+    }
+    if (!pending.completer.isCompleted) {
+      pending.completer.complete(null);
+    }
+    _pendingResponse = null;
   }
 
   void _onData(Uint8List data) {
@@ -179,11 +237,13 @@ class BluetoothService {
       _buffer = _buffer.substring(newlineIndex + 1);
       if (line.isNotEmpty) {
         _lineController.add(line);
+        _pendingResponse?.maybeComplete(line);
       }
     }
   }
 
   void dispose() {
+    _failPendingCommand();
     _dataSubscription?.cancel();
     _statusSubscription?.cancel();
     _lineController.close();
