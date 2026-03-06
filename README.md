@@ -100,7 +100,7 @@ Notes:
 
 Main sketch:
 
-- `firmware/smart_medicine_reminder/smart_medicine_reminder.ino`
+- `firmware/smart_medicine_reminder_v2/smart_medicine_reminder_v2.ino`
 
 Required Arduino libraries:
 
@@ -143,6 +143,7 @@ Steps:
 
 - `GET`
 - `TIME,YYYY-MM-DD,HH:MM:SS`
+- `SYNC2,D@HH:MM|O@YYYY-MM-DD@HH:MM,...` (3 descriptors: med1/med2/med3)
 - `SYNC,HH:MM,HH:MM,HH:MM`
 - `SET,1,HH:MM` (or slot 2/3)
 - `TEST,1` (or slot 2/3)
@@ -151,7 +152,7 @@ Steps:
 ### Device -> App
 
 - `OK,...`
-- `SCHED,1,HH:MM,2,HH:MM,3,HH:MM`
+- `SCHED2,1,<descriptor>,2,<descriptor>,3,<descriptor>`
 - `ERR,BAD_FORMAT`
 - `ERR,RTC_NOT_SET`
 - `EVT,DUE,<m1>,<m2>,<m3>`

@@ -68,3 +68,40 @@
 - `app/android/key.properties` is currently missing, so release signing falls back to debug key.
 - Before Play Store upload, create `app/upload-keystore.jks` and `app/android/key.properties`, then rebuild.
 - Physical-device validation for notifications, Bluetooth sync, and ESP32 scheduling is still pending.
+
+## 2026-03-05
+
+### Environment
+- Workspace updated to use v2 firmware source:
+  - `firmware/smart_medicine_reminder_v2/smart_medicine_reminder_v2.ino`
+
+### Checks Performed
+1. App sync flow updated to prefer `SYNC2` (date-aware descriptors).
+2. Added automatic fallback to legacy `SYNC` for older firmware that returns `ERR,BAD_FORMAT` or no SYNC2 acknowledgement.
+3. Updated README firmware upload target and protocol docs for `SYNC2`/`SCHED2`.
+4. Updated Connect screen to allow direct connection attempts for paired/saved devices even when not discovered in the last scan window.
+5. Simplified sync behavior to reduce false failures:
+   - disabled auto-sync on reconnect
+   - if `TIME` fails, app still attempts `SYNC2` / `SYNC` so schedule can still be sent.
+
+### Runtime Test Results
+- Flutter static analysis:
+  - `flutter analyze` (from `app/`) -> **No issues found**
+- Flutter build:
+  - `flutter build apk --debug` (from `app/`) -> **Success**
+  - Output: `app/build/app/outputs/flutter-apk/app-debug.apk`
+- Flutter tests:
+  - `flutter test` (from `app/`) -> **All tests passed** (`3 passed`)
+- Firmware compile:
+  - `arduino-cli compile --fqbn esp32:esp32:esp32 firmware/smart_medicine_reminder_v2` -> **Success**
+  - Binary size: `1115783 bytes` (85% of `1310720`)
+  - RAM use: `43988 bytes` (13% of `327680`)
+  - Note: Arduino warning shown for `LiquidCrystal I2C` AVR architecture metadata; compile still successful for ESP32.
+
+### Known Issues / Follow-up
+- Run phone + device integration test:
+  - set one-time schedule in app
+  - confirm firmware stores `O@YYYY-MM-DD@HH:MM`
+  - verify one-time schedule triggers once and does not repeat next day.
+- Manual Bluetooth connect verification still needed on physical phone after the Connect screen gating fix.
+- Validate that schedule sync works even when `TIME` intermittently fails.

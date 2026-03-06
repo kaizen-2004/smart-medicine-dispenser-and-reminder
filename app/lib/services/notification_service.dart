@@ -102,6 +102,7 @@ class NotificationService {
   Future<void> scheduleReminders(
     MedicineSchedule schedule, {
     required bool useExactAlarms,
+    int delaySeconds = 0,
   }) async {
     for (var medicineNumber = 1; medicineNumber <= 3; medicineNumber++) {
       final plan = schedule.planForMedicine(medicineNumber);
@@ -109,7 +110,7 @@ class NotificationService {
         medicineNumber,
         plan,
         useExactAlarms: useExactAlarms,
-        delaySeconds: 0,
+        delaySeconds: delaySeconds,
       );
     }
   }
@@ -117,8 +118,13 @@ class NotificationService {
   Future<void> scheduleDailyReminders(
     MedicineSchedule schedule, {
     required bool useExactAlarms,
+    int delaySeconds = 0,
   }) {
-    return scheduleReminders(schedule, useExactAlarms: useExactAlarms);
+    return scheduleReminders(
+      schedule,
+      useExactAlarms: useExactAlarms,
+      delaySeconds: delaySeconds,
+    );
   }
 
   Future<void> cancelReminderForMedicine(int medicineNumber) async {

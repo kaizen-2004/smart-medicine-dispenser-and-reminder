@@ -217,18 +217,6 @@ class _ConnectDeviceScreenState extends State<ConnectDeviceScreen> {
       return;
     }
 
-    final connectedToSameDevice =
-        widget.bluetoothService.isConnected &&
-        widget.bluetoothService.lastAddress == device.address;
-    if (!connectedToSameDevice && !_wasDiscoveredRecently(device.address)) {
-      setState(() {
-        _statusTone = _StatusTone.warning;
-        _statusText =
-            "Device is offline. Turn on the pillbox, tap SCAN, then CONNECT.";
-      });
-      return;
-    }
-
     setState(() {
       _connectingAddress = device.address;
       _statusTone = _StatusTone.info;
@@ -246,6 +234,7 @@ class _ConnectDeviceScreenState extends State<ConnectDeviceScreen> {
 
       if (connected) {
         await _saveAssociatedAddress(device.address);
+        _discoveredAt[device.address] = DateTime.now();
         setState(() {
           _connectingAddress = null;
           _isScanning = false;
@@ -593,22 +582,26 @@ class _ConnectDeviceScreenState extends State<ConnectDeviceScreen> {
       itemBuilder: (context, index) {
         final device = visibleDevices[index];
         final connecting = _connectingAddress == device.address;
+        final isLinkedDevice =
+            _associatedAddress != null &&
+            _associatedAddress!.isNotEmpty &&
+            _associatedAddress == device.address;
         final connectedToSameDevice =
             widget.bluetoothService.isConnected &&
             widget.bluetoothService.lastAddress == device.address;
         final discoveredRecently = _wasDiscoveredRecently(device.address);
-        final isOffline = !connectedToSameDevice && !discoveredRecently;
-
         final statusLabel = connectedToSameDevice
             ? "Connected"
             : discoveredRecently
             ? "Online"
-            : "Offline";
+            : isLinkedDevice
+            ? "Paired"
+            : "Saved";
         final statusColor = connectedToSameDevice
             ? const Color(0xFF1B5E20)
             : discoveredRecently
             ? const Color(0xFF1565C0)
-            : const Color(0xFFB71C1C);
+            : const Color(0xFF455A64);
 
         return Container(
           margin: const EdgeInsets.only(bottom: 10),
@@ -674,14 +667,10 @@ class _ConnectDeviceScreenState extends State<ConnectDeviceScreen> {
                     child: CircularProgressIndicator(strokeWidth: 2.4),
                   )
                 : ElevatedButton(
-                    onPressed: isOffline
-                        ? null
-                        : () => _connectToDevice(device),
+                    onPressed: () => _connectToDevice(device),
                     style: ElevatedButton.styleFrom(
                       backgroundColor: const Color(0xFF2E7D32),
                       foregroundColor: Colors.white,
-                      disabledBackgroundColor: const Color(0x1A2E7D32),
-                      disabledForegroundColor: const Color(0x802E7D32),
                       shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(999),
                       ),

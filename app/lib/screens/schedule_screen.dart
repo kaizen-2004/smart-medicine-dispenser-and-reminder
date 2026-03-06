@@ -28,11 +28,13 @@ class _NextIntake {
 class _DeviceCommandResult {
   final bool sent;
   final bool ackReceived;
+  final String? responseLine;
   final String? errorMessage;
 
   const _DeviceCommandResult({
     required this.sent,
     required this.ackReceived,
+    this.responseLine,
     required this.errorMessage,
   });
 
@@ -40,6 +42,9 @@ class _DeviceCommandResult {
 }
 
 const Duration _dueGracePeriod = Duration(seconds: 30);
+const bool _enableAutoSyncOnReconnect = false;
+const Duration _appTimeDelay = Duration(seconds: 8);
+const int _appReminderDelaySeconds = 8;
 
 class ScheduleScreen extends StatefulWidget {
   final NotificationService notificationService;
@@ -66,7 +71,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
   DateTime? _lastSync;
   bool _isConnected = false;
   bool _syncing = false;
-  DateTime _now = DateTime.now();
+  DateTime _now = DateTime.now().subtract(_appTimeDelay);
   Map<int, bool> _takenToday = {1: false, 2: false, 3: false};
   Map<int, bool> _deviceDueToday = {1: false, 2: false, 3: false};
   final Set<int> _markingInProgress = <int>{};
@@ -95,7 +100,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
         return;
       }
       setState(() {
-        _now = DateTime.now();
+        _now = _appNow();
       });
       _refreshTakenStateIfDateChanged();
     });
@@ -113,7 +118,14 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
       });
 
       if (!wasConnected && isNowConnected) {
-        unawaited(_autoSyncOnReconnect());
+        if (_enableAutoSyncOnReconnect) {
+          unawaited(_autoSyncOnReconnect());
+        } else {
+          _setSyncState(
+            _SyncStateType.idle,
+            "Connected. Tap SYNC to send schedule to the device.",
+          );
+        }
       }
     });
 
@@ -149,7 +161,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
             _deviceDueToday[i + 1] = true;
           }
         }
-        _now = DateTime.now();
+        _now = _appNow();
       });
       return;
     }
@@ -209,7 +221,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
             medicineNumber,
             plan,
             useExactAlarms: _useExactAlarms,
-            delaySeconds: 0,
+            delaySeconds: _appReminderDelaySeconds,
           );
         }
       } catch (_) {}
@@ -225,7 +237,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
 
     setState(() {
       _takenToday = updatedTaken;
-      _now = now;
+      _now = _appNow();
     });
 
     final label = medicines.join(", ");
@@ -252,6 +264,12 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
     });
 
     try {
+      // Give RFCOMM a brief settle window right after connect.
+      await Future<void>.delayed(const Duration(milliseconds: 700));
+      if (!mounted || !_isConnected) {
+        return;
+      }
+
       final result = await _syncDeviceClockAndSchedule();
       final syncError = result.$1;
       final syncWarning = result.$2;
@@ -268,7 +286,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
       }
 
       final syncAt = _lastSync == null
-          ? _formatDateTime(DateTime.now())
+          ? _formatDateTime(_appNow())
           : _formatDateTime(_lastSync!);
       _setSyncState(
         _SyncStateType.success,
@@ -345,7 +363,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
         newTime.hour,
         newTime.minute,
       );
-      if (!oneTimeDateTime.isAfter(DateTime.now())) {
+      if (!oneTimeDateTime.isAfter(_appNow())) {
         _setSyncState(
           _SyncStateType.error,
           "One-time schedule must be set to a future date and time.",
@@ -557,6 +575,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
       await widget.notificationService.scheduleReminders(
         _schedule,
         useExactAlarms: _useExactAlarms,
+        delaySeconds: _appReminderDelaySeconds,
       );
     } catch (_) {}
 
@@ -605,9 +624,16 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
       return;
     }
 
-    final status = _doseStatus(medicineNumber);
-    if (status != _DoseStatus.due) {
-      _showSnack("Medicine $medicineNumber can only be marked when status is Due.");
+    final dueMedicines = <int>[];
+    for (var number = 1; number <= 3; number++) {
+      if (_doseStatus(number) == _DoseStatus.due) {
+        dueMedicines.add(number);
+      }
+    }
+    if (!dueMedicines.contains(medicineNumber)) {
+      _showSnack(
+        "Medicine $medicineNumber can only be marked when status is Due.",
+      );
       return;
     }
 
@@ -619,53 +645,86 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
     });
 
     try {
+      final medicinesToMark = _isConnected
+          ? dueMedicines
+          : <int>[medicineNumber];
+      var hadAckTimeout = false;
+
       if (_isConnected) {
-        final ackResult = await _sendDeviceCommand(
-          "ACK,$medicineNumber",
-          commandName: "ACK",
-          requireAck: true,
-          timeout: const Duration(seconds: 3),
-          retryOnNoResponse: false,
-        );
-        if (!ackResult.isSuccess) {
-          _showSnack(
-            "Failed to close compartment for medicine $medicineNumber: "
-            "${ackResult.errorMessage ?? "unknown error"}",
+        for (final number in medicinesToMark) {
+          final ackResult = await _sendDeviceCommand(
+            "ACK,$number",
+            commandName: "ACK",
+            requireAck: true,
+            timeout: const Duration(seconds: 5),
+            retryOnNoResponse: true,
           );
-          return;
+          if (!ackResult.isSuccess) {
+            // Some devices execute ACK but drop the response line.
+            // If link is still connected and command was sent, treat as soft success.
+            if (ackResult.sent &&
+                !ackResult.ackReceived &&
+                widget.bluetoothService.isConnected) {
+              hadAckTimeout = true;
+              continue;
+            }
+            _showSnack(
+              "Failed to close compartment for medicine $number: "
+              "${ackResult.errorMessage ?? "unknown error"}",
+            );
+            return;
+          }
         }
       }
-
-      await widget.scheduleStorage.saveTakenStateForDate(
-        _now,
-        medicineNumber: medicineNumber,
-        taken: true,
-      );
 
       if (mounted) {
         setState(() {
-          _takenToday[medicineNumber] = true;
-          _deviceDueToday[medicineNumber] = false;
+          for (final number in medicinesToMark) {
+            _takenToday[number] = true;
+            _deviceDueToday[number] = false;
+          }
         });
       }
 
-      try {
-        await widget.notificationService.cancelReminderForMedicine(
-          medicineNumber,
+      for (final number in medicinesToMark) {
+        await widget.scheduleStorage.saveTakenStateForDate(
+          _now,
+          medicineNumber: number,
+          taken: true,
         );
-        final plan = _schedule.planForMedicine(medicineNumber);
-        if (plan.isDaily) {
-          await widget.notificationService.scheduleReminderForPlan(
-            medicineNumber,
-            plan,
-            useExactAlarms: _useExactAlarms,
-            delaySeconds: 0,
-          );
-        }
-      } catch (_) {}
+        try {
+          await widget.notificationService.cancelReminderForMedicine(number);
+          final plan = _schedule.planForMedicine(number);
+          if (plan.isDaily) {
+            await widget.notificationService.scheduleReminderForPlan(
+              number,
+              plan,
+              useExactAlarms: _useExactAlarms,
+              delaySeconds: _appReminderDelaySeconds,
+            );
+          }
+        } catch (_) {}
+      }
 
       if (_isConnected) {
-        _showSnack("Medicine $medicineNumber marked as taken.");
+        if (medicinesToMark.length == 1) {
+          _showSnack("Medicine ${medicinesToMark.first} marked as taken.");
+        } else {
+          _showSnack(
+            "Due medicines ${medicinesToMark.join(", ")} marked as taken.",
+          );
+        }
+        if (hadAckTimeout) {
+          _setSyncState(
+            _SyncStateType.idle,
+            "Acknowledge response from device was delayed. Status was updated locally.",
+          );
+        } else {
+          _setSyncState(
+            _SyncStateType.success,
+            "Acknowledge synced with device.",
+          );
+        }
       } else {
         _showSnack(
           "Medicine $medicineNumber marked as taken (phone only). "
@@ -713,6 +772,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
       await widget.notificationService.scheduleReminders(
         _schedule,
         useExactAlarms: true,
+        delaySeconds: _appReminderDelaySeconds,
       );
 
       if (successMessage != null) {
@@ -822,39 +882,150 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
       return ("device is not connected. Reconnect and tap SYNC again.", null);
     }
 
+    String? warning;
     final now = DateTime.now();
     final timeCommand = "TIME,${_formatDate(now)},${_formatClock(now)}";
     final timeResult = await _sendDeviceCommand(
       timeCommand,
       commandName: "TIME",
       requireAck: true,
-      timeout: const Duration(seconds: 2),
-      retryOnNoResponse: false,
+      timeout: const Duration(seconds: 5),
+      retryOnNoResponse: true,
     );
-    if (!timeResult.isSuccess) {
-      return (timeResult.errorMessage, null);
+    if (!timeResult.isSuccess && timeResult.errorMessage != null) {
+      warning =
+          "Device clock was not updated (${timeResult.errorMessage}). Schedule sync will still be attempted.";
     }
 
-    final syncResult = await _sendDeviceCommand(
+    final sync2Result = await _sendDeviceCommand(
+      _schedule.toSyncCommand(),
+      commandName: "SYNC2",
+      requireAck: true,
+    );
+    if (sync2Result.isSuccess) {
+      _lastSync = DateTime.now();
+      await widget.scheduleStorage.saveLastSync(_lastSync!);
+      return (null, warning);
+    }
+
+    final verifiedAfterSync2 = await _verifyScheduleAppliedWithGet();
+    if (verifiedAfterSync2.$1) {
+      _lastSync = DateTime.now();
+      await widget.scheduleStorage.saveLastSync(_lastSync!);
+      final verifyWarning =
+          "Schedule appears applied on device, but SYNC2 acknowledgement was not received.";
+      if (warning != null) {
+        return (null, "$warning $verifyWarning");
+      }
+      return (null, verifyWarning);
+    }
+
+    final shouldTryLegacyFallback =
+        sync2Result.responseLine == "ERR,BAD_FORMAT" ||
+        (sync2Result.sent &&
+            !sync2Result.ackReceived &&
+            widget.bluetoothService.isConnected);
+    if (!shouldTryLegacyFallback) {
+      return (sync2Result.errorMessage, null);
+    }
+
+    final legacySyncResult = await _sendDeviceCommand(
       _schedule.toLegacyDailySyncCommand(),
       commandName: "SYNC",
       requireAck: true,
     );
-    if (!syncResult.isSuccess) {
-      return (syncResult.errorMessage, null);
+    if (!legacySyncResult.isSuccess) {
+      final verifiedAfterLegacy = await _verifyScheduleAppliedWithGet();
+      if (verifiedAfterLegacy.$1) {
+        _lastSync = DateTime.now();
+        await widget.scheduleStorage.saveLastSync(_lastSync!);
+        final verifyWarning =
+            "Schedule appears applied on device, but SYNC acknowledgement was not received.";
+        if (warning != null) {
+          return (null, "$warning $verifyWarning");
+        }
+        return (null, verifyWarning);
+      }
+      return (legacySyncResult.errorMessage ?? sync2Result.errorMessage, null);
     }
 
     _lastSync = DateTime.now();
     await widget.scheduleStorage.saveLastSync(_lastSync!);
     if (_schedule.hasOneTimeSchedule) {
+      final compatibilityWarning =
+          "Device synced using legacy SYNC compatibility mode. One-time schedules "
+          "were sent as daily HH:MM because SYNC2 is not available on the "
+          "connected firmware.";
+      if (warning != null) {
+        return (null, "$warning $compatibilityWarning");
+      }
+      return (null, compatibilityWarning);
+    }
+    if (warning != null) {
       return (
         null,
-        "Device synced with daily fallback. Current device firmware cannot "
-            "store date-based one-time schedules (hardware/firmware limitation), "
-            "so one-time slots were sent as daily HH:MM times.",
+        "$warning Device synced using legacy SYNC compatibility mode.",
       );
     }
-    return (null, null);
+    return (null, "Device synced using legacy SYNC compatibility mode.");
+  }
+
+  Future<(bool, String?)> _verifyScheduleAppliedWithGet() async {
+    final line = await _requestDeviceScheduleLine();
+    if (line == null || line.isEmpty) {
+      return (false, null);
+    }
+
+    if (line.startsWith("SCHED2,")) {
+      return (_matchesSched2Line(line), line);
+    }
+    if (line.startsWith("SCHED,")) {
+      return (_matchesLegacySchedLine(line), line);
+    }
+    return (false, line);
+  }
+
+  Future<String?> _requestDeviceScheduleLine() async {
+    try {
+      return await widget.bluetoothService.sendCommandExpectingLine(
+        "GET",
+        timeout: const Duration(seconds: 5),
+        retryOnNoResponse: true,
+        acceptResponse: (line) {
+          return line.startsWith("SCHED2,") ||
+              line.startsWith("SCHED,") ||
+              line.startsWith("ERR,");
+        },
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  bool _matchesSched2Line(String line) {
+    final parts = line.split(",");
+    if (parts.length != 7 || parts[0] != "SCHED2") {
+      return false;
+    }
+    if (parts[1] != "1" || parts[3] != "2" || parts[5] != "3") {
+      return false;
+    }
+    return parts[2] == _schedule.medicine1.syncDescriptor() &&
+        parts[4] == _schedule.medicine2.syncDescriptor() &&
+        parts[6] == _schedule.medicine3.syncDescriptor();
+  }
+
+  bool _matchesLegacySchedLine(String line) {
+    final parts = line.split(",");
+    if (parts.length != 7 || parts[0] != "SCHED") {
+      return false;
+    }
+    if (parts[1] != "1" || parts[3] != "2" || parts[5] != "3") {
+      return false;
+    }
+    return parts[2] == _schedule.medicine1.time.to24HourString() &&
+        parts[4] == _schedule.medicine2.time.to24HourString() &&
+        parts[6] == _schedule.medicine3.time.to24HourString();
   }
 
   Future<_DeviceCommandResult> _sendDeviceCommand(
@@ -889,15 +1060,17 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
 
     if (response != null) {
       if (response.startsWith("OK")) {
-        return const _DeviceCommandResult(
+        return _DeviceCommandResult(
           sent: true,
           ackReceived: true,
+          responseLine: response,
           errorMessage: null,
         );
       }
       return _DeviceCommandResult(
         sent: true,
         ackReceived: true,
+        responseLine: response,
         errorMessage: "$commandName failed ($response). Tap SYNC again.",
       );
     }
@@ -906,6 +1079,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
       return _DeviceCommandResult(
         sent: false,
         ackReceived: false,
+        responseLine: null,
         errorMessage:
             "device disconnected during $commandName sync. Reconnect and tap "
             "SYNC again.",
@@ -916,6 +1090,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
       return _DeviceCommandResult(
         sent: true,
         ackReceived: false,
+        responseLine: null,
         errorMessage:
             "No response from device for $commandName. Keep connection active "
             "and try again.",
@@ -925,6 +1100,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
     return const _DeviceCommandResult(
       sent: true,
       ackReceived: false,
+      responseLine: null,
       errorMessage: null,
     );
   }
@@ -1809,7 +1985,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
                         ),
                         padding: EdgeInsets.zero,
                       ),
-                ),
+              ),
             ),
           ),
         ],
@@ -1897,6 +2073,8 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
     return "${dateTime.year.toString().padLeft(4, "0")}"
         "${_two(dateTime.month)}${_two(dateTime.day)}";
   }
+
+  DateTime _appNow() => DateTime.now().subtract(_appTimeDelay);
 
   String _two(int value) => value.toString().padLeft(2, "0");
 }
