@@ -208,7 +208,9 @@ class BluetoothService {
 
     _statusSubscription ??= _classic.onDeviceStatusChanged().listen((status) {
       _lastStatus = status;
-      if (status != Device.connected) {
+      // Do not fail pending commands on transient "connecting" state.
+      // Only abort when explicitly disconnected.
+      if (status == Device.disconnected) {
         _failPendingCommand();
       }
       _statusController.add(status);
